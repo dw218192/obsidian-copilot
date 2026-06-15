@@ -555,6 +555,7 @@ describe("buildOpencodeConfig — agent/prompt/mode/skills blocks (preserved)", 
         mcpServers: [],
         activeBackend: "opencode",
         debugFullFrames: false,
+        welcomeDismissed: false,
         skills: { folder: "copilot/skills" },
         backends: {
           opencode: {
@@ -575,6 +576,7 @@ describe("buildOpencodeConfig — agent/prompt/mode/skills blocks (preserved)", 
         mcpServers: [],
         activeBackend: "opencode",
         debugFullFrames: false,
+        welcomeDismissed: false,
         skills: { folder: "copilot/skills" },
         backends: {
           opencode: {
@@ -595,6 +597,7 @@ describe("buildOpencodeConfig — agent/prompt/mode/skills blocks (preserved)", 
         mcpServers: [],
         activeBackend: "opencode",
         debugFullFrames: false,
+        welcomeDismissed: false,
         skills: { folder: "copilot/skills" },
         backends: {
           opencode: { binaryPath: "/x" },
@@ -670,6 +673,7 @@ describe("buildOpencodeConfig — agent/prompt/mode/skills blocks (preserved)", 
         mcpServers: [],
         activeBackend: "opencode",
         debugFullFrames: false,
+        welcomeDismissed: false,
         skills: { folder: "team-skills" },
         backends: {},
       },
@@ -760,6 +764,7 @@ describe("OpencodeBackend.buildSpawnDescriptor", () => {
       mcpServers: [],
       activeBackend: "opencode",
       debugFullFrames: false,
+      welcomeDismissed: false,
       skills: { folder: "copilot/skills" },
       backends: {
         opencode: {

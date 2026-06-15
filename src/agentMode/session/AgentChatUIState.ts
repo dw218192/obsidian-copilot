@@ -4,6 +4,7 @@ import type { AgentSession } from "@/agentMode/session/AgentSession";
 import type {
   AgentChatMessage,
   AgentQuestionAnswers,
+  AgentTodoListEntry,
   AskUserQuestionPrompt,
   BackendState,
   CurrentPlan,
@@ -33,6 +34,7 @@ export class AgentChatUIState implements AgentChatBackend {
       onStatusChanged: () => this.notifyListeners(),
       onModelChanged: () => this.notifyListeners(),
       onCurrentPlanChanged: () => this.notifyListeners(),
+      onCurrentTodoListChanged: () => this.notifyListeners(),
     });
   }
 
@@ -143,6 +145,10 @@ export class AgentChatUIState implements AgentChatBackend {
 
   getCurrentPlan(): CurrentPlan | null {
     return this.session.getCurrentPlan();
+  }
+
+  getCurrentTodoList(): AgentTodoListEntry[] | null {
+    return this.session.getCurrentTodoList();
   }
 
   async resolvePlanProposal(

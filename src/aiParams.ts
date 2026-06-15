@@ -41,6 +41,13 @@ export interface FailedItem {
   type: "md" | "web" | "youtube" | "nonMd";
   error?: string;
   timestamp?: number;
+  /**
+   * Agent project context only: the source's refresh failed but a previous
+   * snapshot is still in use, so it's stale-but-usable rather than missing.
+   * Lets the status icon stay "ready" (green) while the popover flags the
+   * staleness. Undefined for the legacy CAG failure tracker.
+   */
+  usedStaleSnapshot?: boolean;
 }
 
 interface ProjectContextLoadState {
@@ -56,6 +63,54 @@ export const projectContextLoadAtom = atom<ProjectContextLoadState>({
   processingFiles: [],
   total: [],
 });
+
+/** Done-of-total progress for one materialization step (prefetch / parse). */
+export interface ContextLoadStepCount {
+  done: number;
+  total: number;
+}
+
+export interface AgentProjectContextLoadState {
+  phase: "idle" | "resolve" | "prefetch" | "parse" | "done";
+  blocking: boolean; // true while send should be gated for this project
+  /**
+   * In-vault binary files queued for text materialization, known once the
+   * materializer resolves inclusions. Drives the card's "Resolve files (N)" row.
+   * Omitted until resolve completes (and stays omitted for a context with none).
+   */
+  resolved?: number;
+  /** Remote (web/YouTube) prefetch progress; omitted when there are no remotes. */
+  prefetch?: ContextLoadStepCount;
+  /** Binary-file parse progress; omitted when there are no files to parse. */
+  parsed?: ContextLoadStepCount;
+  /**
+   * Per-source fetch/parse failures from the last run. A run with failures still
+   * completes as `phase: "done"` (the session degrades gracefully); these drive
+   * the status icon's warning state and the popover's failed-source list. Always
+   * republished on `done` (empty array when everything succeeded) so a prior
+   * run's failures never linger.
+   */
+  failedSources?: FailedItem[];
+  /**
+   * Sources whose per-source retry is currently in flight (the popover row
+   * "Retry"). Drives an optimistic "processing" state on that row so a click has
+   * immediate feedback even when the retry ends up failing again. Never gates
+   * send (`blocking` stays false); cleared when each retry settles.
+   */
+  retryingSources?: AgentRetryingSource[];
+}
+
+/** A source whose per-source retry is currently in flight (popover row "Retry"). */
+export interface AgentRetryingSource {
+  kind: "web" | "youtube" | "file";
+  source: string;
+}
+
+/** Frozen empty list — referential stability for the "no retries in flight" case. */
+export const EMPTY_RETRYING_SOURCES: readonly AgentRetryingSource[] = Object.freeze([]);
+/** Per-project context-load state, keyed by projectId. Driven by AgentSessionManager's
+ *  materialize step; read by AgentContextStatusIcon / AgentChatInput to show progress + gate send. */
+export const agentProjectContextLoadAtom = atom<Record<string, AgentProjectContextLoadState>>({});
 
 interface IndexingProgressState {
   isActive: boolean;
@@ -84,6 +139,8 @@ export interface ProjectConfig {
   name: string;
   description?: string;
   systemPrompt: string;
+  // Old CAG Project Chain model selector. Agent Mode does NOT read this (it uses
+  // agentMode.activeBackend + the backend's default model); kept for CAG runtime + YAML compat.
   projectModelKey: string;
   modelConfigs: {
     temperature?: number;

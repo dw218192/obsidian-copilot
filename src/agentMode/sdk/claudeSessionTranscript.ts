@@ -100,7 +100,7 @@ function joinTextBlocks(content: ContentBlock[]): string {
 
 /**
  * Unwrap the plugin's `<user-message>…</user-message>` envelope so the stored
- * prompt (which prepends a `<copilot-context>` block when notes are attached)
+ * prompt (which prepends an `<attached_context>` block when notes are attached)
  * displays as just what the user typed. Returns the input unchanged when no
  * wrapper is present (prompts sent without attached context aren't wrapped).
  */

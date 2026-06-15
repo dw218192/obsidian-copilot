@@ -1,10 +1,13 @@
 import { AI_SENDER, USER_SENDER, WEB_SELECTED_TEXT_TAG } from "@/constants";
 import { logInfo, logWarn } from "@/logger";
 import { AgentMessageStore } from "@/agentMode/session/AgentMessageStore";
+import { GLOBAL_SCOPE, type ProjectScopeId } from "@/agentMode/session/scope";
 import {
   AgentChatMessage,
   AgentMessagePart,
+  AgentPlanEntry,
   AgentQuestionAnswers,
+  AgentTodoListEntry,
   AgentToolCallOutput,
   AskUserQuestionPrompt,
   BackendDescriptor,
@@ -40,6 +43,7 @@ import { resolveMcpServers } from "@/agentMode/session/mcpResolver";
 import { deriveChatTitleFromMessages } from "@/agentMode/session/chatHistoryMerge";
 import { getSettings } from "@/settings/model";
 import { ContextProcessor } from "@/contextProcessor";
+import type { ContextMaterializationResult } from "@/context/projectContextMaterializer";
 import { escapeXml } from "@/LLMProviders/chainRunner/utils/xmlParsing";
 
 /**
@@ -68,6 +72,9 @@ const EMPTY_QUESTIONS: AskUserQuestionPrompt[] = [];
 // Canonical "no answers" map. Resolving an in-flight question with this on
 // cancel/dispose makes the bridge treat it as a user cancellation.
 const EMPTY_ANSWERS: AgentQuestionAnswers = Object.freeze({});
+// Shared "no extra roots" array so a session created without project context
+// keeps a stable reference (no fresh `[]` allocation per construction).
+const EMPTY_ADDITIONAL_DIRECTORIES: string[] = Object.freeze([]) as unknown as string[];
 
 /**
  * Optimistically swap `state.model.current.baseModelId` for the persisted
@@ -138,6 +145,12 @@ export interface AgentSessionListener {
    */
   onCurrentPlanChanged?(): void;
   /**
+   * Optional: fired when the live execution todo list changes (a backend
+   * `plan` update with different content arrived, or the session reset).
+   * The project-info Progress section subscribes to this channel.
+   */
+  onCurrentTodoListChanged?(): void;
+  /**
    * Optional: fired when the "needs attention" flag flips. The tab strip
    * subscribes to render an accent dot on the brand icon for backgrounded
    * sessions that finished, errored, or paused for permission while the
@@ -151,6 +164,11 @@ export interface AgentSessionStartOptions {
   cwd: string;
   internalId: string;
   backendId: BackendId;
+  /**
+   * Scope this session belongs to. Immutable like `backendId`; defaults to
+   * {@link GLOBAL_SCOPE} (the implicit global workspace).
+   */
+  projectId?: ProjectScopeId;
   /**
    * Persisted user preference to apply after the backend's initial session
    * state. The session seeds it optimistically so the first picker paint
@@ -171,6 +189,19 @@ export interface AgentSessionStartOptions {
    * without coupling to specific backends. Manager-supplied; tests omit it.
    */
   getDescriptor?: () => BackendDescriptor | undefined;
+  /**
+   * Resolves to the project's context-materialization result. Supplied by the
+   * manager and awaited in `initialize` right BEFORE `newSession`, so the
+   * session appears immediately (send-gated by the loading card) while prefetch
+   * runs in the background and the backend still gets the roots once they're
+   * ready. Absent for GLOBAL / context-free sessions — `initialize` then opens
+   * without delay.
+   *
+   * Carries both the extra searchable roots (forwarded to `newSession`) and the
+   * optional inline `<project_context>` block, captured for injection into this
+   * session's first user prompt.
+   */
+  contextReady?: Promise<ContextMaterializationResult>;
 }
 
 /**
@@ -182,6 +213,8 @@ export interface AgentSessionStateOptions {
   backendSessionId: SessionId;
   internalId: string;
   backendId: BackendId;
+  /** Scope this session belongs to. See {@link AgentSessionStartOptions.projectId}. */
+  projectId?: ProjectScopeId;
   initialState?: BackendState | null;
   /**
    * Optional persisted user preference applied to the warm/adopted session.
@@ -210,11 +243,24 @@ export class AgentSession {
   readonly store = new AgentMessageStore();
   readonly internalId: string;
   readonly backendId: BackendId;
+  /** Immutable scope binding ({@link GLOBAL_SCOPE} or a project id). */
+  readonly projectId: ProjectScopeId;
   /** Resolves when `newSession` succeeds; rejects when it fails. */
   readonly ready: Promise<void>;
   private backendSessionId: SessionId | null = null;
   private readonly backend: BackendProcess;
   private readonly cwd: string | null;
+  // Resolves to the project's context-materialization result; awaited before
+  // `newSession` (null for context-free / resumed sessions, which open without
+  // delay).
+  private readonly contextReady: Promise<ContextMaterializationResult> | null;
+  // The project's `<project_context>` block, captured from `contextReady` in
+  // `initialize`. Inlined into the FIRST user prompt only (see `runTurn` /
+  // `buildPromptBlocks`); null for GLOBAL / context-free / resumed sessions.
+  private projectContextBlock: string | null = null;
+  // Flips true once the first user prompt has been built, so the project-context
+  // block is injected exactly once at the head of the conversation.
+  private firstPromptSent = false;
   private readonly getDescriptor: (() => BackendDescriptor | undefined) | null;
   // `status` is derived from the primitives below — see `getStatus()`.
   // `cachedStatus` is a memo of the last value we fired through
@@ -291,6 +337,15 @@ export class AgentSession {
   // while in canonical plan mode and a plan has been proposed; cleared on a
   // terminal user decision or when the canonical mode flips out of plan.
   private currentPlan: CurrentPlan | null = null;
+  // Live execution todo list — the latest `plan` update's entries, normalized
+  // for consumers (the trail's PlanPill reads the message part instead; this
+  // snapshot feeds surfaces outside the message flow). LIVE-ONLY by design:
+  // chat persistence drops plan parts, so a resumed/reloaded session starts
+  // at null and repopulates on the agent's next todo update.
+  private currentTodoList: AgentTodoListEntry[] | null = null;
+  // Signature of the last applied list — multiple equal plan updates (e.g.
+  // opencode's synthesized + occasional real plan channel) must not re-notify.
+  private currentTodoListSignature: string | null = null;
   // Monotonic counter for `currentPlan.id` so the React tree can detect a
   // *new* plan-mode review (vs. an in-place revision that bumps `revision`).
   private planSeq = 0;
@@ -314,8 +369,12 @@ export class AgentSession {
     this.backend = opts.backend;
     this.internalId = opts.internalId;
     this.backendId = opts.backendId;
+    this.projectId = opts.projectId ?? GLOBAL_SCOPE;
     this.cwd = opts.cwd ?? null;
     this.getDescriptor = opts.getDescriptor ?? null;
+    // Only the start path (newSession) awaits context roots; adopted/resumed
+    // sessions had theirs forwarded by the manager's resume/load call already.
+    this.contextReady = "contextReady" in opts ? (opts.contextReady ?? null) : null;
     if ("backendSessionId" in opts) {
       this.backendSessionId = opts.backendSessionId;
       const originalState = opts.initialState ?? null;
@@ -364,9 +423,27 @@ export class AgentSession {
   private async initialize(opts: AgentSessionStartOptions): Promise<void> {
     const { backend, cwd, defaultModelSelection } = opts;
     try {
+      // Await the project's context roots (if any) BEFORE opening the session.
+      // The session is already visible and send-gated by the loading card; this
+      // delay only postpones the backend round-trip until prefetch settles. The
+      // promise never rejects (degrades to empty), so it can't strand startup.
+      const contextResult = this.contextReady ? await this.contextReady : null;
+      const additionalDirectories =
+        contextResult?.additionalDirectories ?? EMPTY_ADDITIONAL_DIRECTORIES;
+      // Capture the inline `<project_context>` block for this session's first
+      // prompt. The roots go to `newSession` below; the block rides the first
+      // user message (see `runTurn`).
+      this.projectContextBlock = contextResult?.projectContextBlock ?? null;
+      if (this.disposed) return;
       const resp = await backend.newSession({
         cwd,
         mcpServers: resolveMcpServers(backend, getSettings().agentMode?.mcpServers),
+        // Capture the owning scope alongside cwd so the backend can resolve
+        // this project's instructions; GLOBAL_SCOPE for the global workspace.
+        projectId: this.projectId,
+        // Extra searchable roots from the project's materialized context. The
+        // backend honors them only when it advertises the capability.
+        additionalDirectories,
       });
       if (this.disposed) return;
       const modelLog = resp.state.model
@@ -801,12 +878,25 @@ export class AgentSession {
       // synchronously within this turn (callers rely on that timing).
       const hasWebTabs = (context?.webTabs?.length ?? 0) > 0;
       const webTabBlock = hasWebTabs ? await serializeWebTabContext(context) : "";
-      const promptBlocks = buildPromptBlocks(displayText, context, promptContent, webTabBlock);
+      // The project-context block rides the FIRST user prompt only.
+      const isFirstTurn = !this.firstPromptSent;
+      const promptBlocks = buildPromptBlocks(
+        displayText,
+        context,
+        promptContent,
+        webTabBlock,
+        isFirstTurn ? this.projectContextBlock : null
+      );
       const req: PromptInput = {
         sessionId,
         prompt: promptBlocks,
       };
       const resp = await this.backend.prompt(req);
+      // Mark the block delivered only once the backend has accepted the turn, so
+      // a hard `prompt()` failure (transport/auth) leaves the flag unset and the
+      // user's retry re-delivers the context (a user cancel still resolves here,
+      // and the prompt did reach the backend, so it counts as delivered).
+      if (isFirstTurn) this.firstPromptSent = true;
       if (
         placeholderId &&
         resp.stopReason !== "cancelled" &&
@@ -897,6 +987,8 @@ export class AgentSession {
     this.flushQuestionResolvers();
     this.decidedPlanToolCallIds.clear();
     this.currentPlan = null;
+    this.currentTodoList = null;
+    this.currentTodoListSignature = null;
     this.settledStream = null;
     this.currentMessageIds = new Set();
     // Fire the `"closed"` transition before clearing listeners so
@@ -955,6 +1047,16 @@ export class AgentSession {
   /** Snapshot of the singleton plan, or `null` if there's nothing to review. */
   getCurrentPlan(): CurrentPlan | null {
     return this.currentPlan;
+  }
+
+  /**
+   * The live execution todo list, or `null` when the session has none (no
+   * update yet, the agent cleared it, or the session was resumed — the
+   * snapshot is live-only; persistence never stores it). Returns the held
+   * array reference so React subscribers don't tear on unrelated ticks.
+   */
+  getCurrentTodoList(): AgentTodoListEntry[] | null {
+    return this.currentTodoList;
   }
 
   /**
@@ -1165,6 +1267,12 @@ export class AgentSession {
 
   private handleSessionEvent(event: SessionEvent): void {
     const update = event.update;
+
+    // Refresh the live todo snapshot before any placeholder gating — the
+    // snapshot is session-scoped state, not part of the message trail.
+    if (update.sessionUpdate === "plan" && this.applyCurrentTodoList(update.entries)) {
+      this.notifyCurrentTodoListChanged();
+    }
 
     // Session-scoped updates aren't tied to a turn placeholder.
     if (update.sessionUpdate === "session_info_update") {
@@ -1422,6 +1530,43 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Apply a `plan` update's entries to the live todo snapshot. Returns true
+   * when the canonical content actually changed (signature compare) — equal
+   * lists from redundant updates (opencode's synthesized + real plan channel,
+   * Claude's multiple stream injection points) are dropped silently. An empty
+   * entries list clears the snapshot back to `null`.
+   *
+   * Layer 2 of 3 in the todo-plan dedup chain — the SNAPSHOT layer: suppresses
+   * no-op `onCurrentTodoListChanged` ticks for the Progress section. It is NOT
+   * redundant with the others: the emit layer (`claudeTodoPlan.emitIfChanged`)
+   * collapses one backend's repeated injections, and `planEntriesEqual`
+   * (AgentMessageStore) dedups the rendered plan message part — this layer is
+   * the only one guarding the live snapshot's listeners, and the only one that
+   * sees ALL backends' plan updates converged.
+   */
+  private applyCurrentTodoList(entries: AgentPlanEntry[]): boolean {
+    const next: AgentTodoListEntry[] = entries.map((e) => ({
+      content: e.content,
+      status: e.status,
+    }));
+    const signature = next.length > 0 ? JSON.stringify(next) : null;
+    if (signature === this.currentTodoListSignature) return false;
+    this.currentTodoList = next.length > 0 ? next : null;
+    this.currentTodoListSignature = signature;
+    return true;
+  }
+
+  private notifyCurrentTodoListChanged(): void {
+    for (const l of this.listeners) {
+      try {
+        l.onCurrentTodoListChanged?.();
+      } catch (e) {
+        logWarn(`[AgentMode] todo-list listener threw`, e);
+      }
+    }
+  }
+
   private notifyCurrentPlanChanged(): void {
     for (const l of this.listeners) {
       try {
@@ -1549,13 +1694,16 @@ export function buildPromptBlocks(
   displayText: string,
   context?: MessageContext,
   content?: PromptContent[],
-  webTabBlock?: string
+  webTabBlock?: string,
+  projectContextBlock?: string | null
 ): PromptContent[] {
-  // Context sections precede the user message: the vault envelope (notes +
-  // note excerpts), web-selection excerpts, then live web-tab content. Web
-  // tab/selection blocks reuse the legacy `<web_*>` tags so the model reads
-  // the same shapes it does in the non-agent chat.
+  // Context sections precede the user message: the project-context block (first
+  // user prompt only — the project's folders/notes/URLs), the vault envelope
+  // (attached notes + note excerpts), web-selection excerpts, then live web-tab
+  // content. Web tab/selection blocks reuse the legacy `<web_*>` tags so the
+  // model reads the same shapes it does in the non-agent chat.
   const sections = [
+    projectContextBlock?.trim() || null,
     buildContextEnvelope(context),
     buildWebSelectionBlocks(context),
     webTabBlock?.trim() || null,
@@ -1602,8 +1750,10 @@ function buildWebSelectionBlocks(context: MessageContext | undefined): string | 
 }
 
 /**
- * Build the `<copilot-context>` envelope listing attached vault paths and
- * inlining note excerpts. Returns `null` when there's nothing to attach.
+ * Build the `<attached_context>` envelope listing the vault items attached to
+ * THIS message (`@notes` + selected excerpts) and inlining note excerpts.
+ * Returns `null` when there's nothing to attach. Distinct from the project-wide
+ * `<project_context>` block, which lists the project's configured sources.
  */
 function buildContextEnvelope(context: MessageContext | undefined): string | null {
   if (!context) return null;
@@ -1612,7 +1762,7 @@ function buildContextEnvelope(context: MessageContext | undefined): string | nul
   if (notePaths.length === 0 && excerpts.length === 0) return null;
 
   const lines: string[] = [
-    "<copilot-context>",
+    "<attached_context>",
     "The user attached the following vault items. The vault is your current working directory; use the Read tool to inspect them when relevant.",
   ];
   if (notePaths.length > 0) {
@@ -1626,7 +1776,7 @@ function buildContextEnvelope(context: MessageContext | undefined): string | nul
       for (const l of e.content.split("\n")) lines.push(`  ${l}`);
     }
   }
-  lines.push("</copilot-context>");
+  lines.push("</attached_context>");
   return lines.join("\n");
 }
 

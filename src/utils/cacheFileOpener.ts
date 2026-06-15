@@ -1,7 +1,9 @@
 import { type ContextCache, getFileCacheRef } from "@/cache/projectContextCache";
 import { CachePreviewModal } from "@/components/modals/CachePreviewModal";
 import type { ProcessingItem } from "@/components/project/processingAdapter";
+import { CONTEXT_CACHE_DIR, cacheFileName } from "@/context/contextCacheStore";
 import { logError } from "@/logger";
+import { isMissingFileError } from "@/utils/isMissingFileError";
 import { App, Notice } from "obsidian";
 
 /**
@@ -95,4 +97,42 @@ export async function openCachedItemPreview(
   }
 
   new CachePreviewModal(app, item.name, content).open();
+}
+
+/**
+ * Open a preview for an AGENT project's converted snapshot — the agent-mode
+ * counterpart to {@link openCachedItemPreview}. The agent pipeline stores each
+ * source's materialized text at `<projectFolder>/.context-cache/<cacheFileName>`.
+ * Same display path as CAG: read the file, hand it to {@link CachePreviewModal}.
+ * The snapshot's leading `<!-- copilot-context-cache … -->` block is an HTML
+ * comment, so the markdown preview hides it and its `# File/URL:` header renders
+ * as a heading — no special stripping needed.
+ */
+export async function openAgentCachedItemPreview(
+  app: App,
+  projectFolder: string,
+  item: Pick<ProcessingItem, "id" | "name" | "cacheKind">
+): Promise<void> {
+  const fileName = cacheFileName(item.cacheKind, item.id);
+  const path = projectFolder
+    ? `${projectFolder}/${CONTEXT_CACHE_DIR}/${fileName}`
+    : `${CONTEXT_CACHE_DIR}/${fileName}`;
+
+  // Read directly instead of an exists()+read() round-trip: a missing snapshot
+  // throws, and we map that back to the "not converted yet" message below.
+  try {
+    const content = await app.vault.adapter.read(path);
+    if (!content.trim()) {
+      new Notice("No content available for this item.");
+      return;
+    }
+    new CachePreviewModal(app, item.name, content).open();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      new Notice("No converted content yet for this item.");
+      return;
+    }
+    logError(`Failed to read agent cached snapshot: ${path}`, error);
+    new Notice("Failed to read converted content.");
+  }
 }

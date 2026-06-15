@@ -43,6 +43,114 @@ export function detectUrlType(url: string): "web" | "youtube" {
 }
 
 /**
+ * Add the `https://` scheme when the user typed a bare host (e.g. "example.com").
+ * Reason: callers store and dedup URLs in normalized form so the same address
+ * typed with/without a scheme collapses to one entry.
+ */
+export function normalizeUrl(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed.startsWith("http") ? trimmed : `https://${trimmed}`;
+}
+
+/**
+ * Build a {@link UrlItem} from a raw (possibly scheme-less) URL string, using the
+ * same stable id scheme as {@link parseProjectUrls} so a value keeps one identity
+ * whether it was just typed or re-parsed from the persisted strings.
+ */
+export function createUrlItem(raw: string): UrlItem {
+  const url = normalizeUrl(raw);
+  const type = detectUrlType(raw);
+  return { id: stableId(type, url), url, type };
+}
+
+const CLOSING_TO_OPENING: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+/**
+ * Trim trailing punctuation a URL accretes from the prose around it — sentence
+ * enders and CJK punctuation — plus an UNBALANCED closing bracket, so
+ * "(see https://x.com)" yields "https://x.com" while a path that legitimately
+ * ends in a balanced bracket (e.g. Wikipedia ".../Foo_(disambiguation)") keeps it.
+ */
+function trimSentencePunctuation(url: string): string {
+  return url.replace(/[.,;:!?，。！？；：、]+$/u, "");
+}
+
+function trimUrlTrailingPunctuation(url: string): string {
+  let next = trimSentencePunctuation(url);
+  while (next.length > 0) {
+    const last = next[next.length - 1];
+    const opener = CLOSING_TO_OPENING[last];
+    if (!opener) break;
+    const opens = next.split(opener).length - 1;
+    const closes = next.split(last).length - 1;
+    if (closes <= opens) break;
+    // Re-trim sentence punctuation that the bracket was hiding ("example.com.)").
+    next = trimSentencePunctuation(next.slice(0, -1));
+  }
+  return next;
+}
+
+/**
+ * Extract http(s) URLs from free-form text. Scheme-anchored on purpose: a bare
+ * dotted token in prose ("1.", "(context.urls)", or a CJK sentence whose `。`
+ * IDNA-folds to a dot) is NOT a URL — and since a legit bare host like
+ * "example.com" is structurally indistinguishable from those, requiring an
+ * explicit http(s):// scheme is the only robust lever against false positives
+ * when a whole document is pasted. Trailing prose punctuation is trimmed and the
+ * result de-duplicated. This is the canonical extractor — `Mention.extractUrls`
+ * (the @-mention pipeline) and {@link parseUrlsFromText} both route through it.
+ */
+export function extractUrlsFromText(text: string): string[] {
+  // Stop the match at whitespace, quotes, angle brackets, and CJK/full-width
+  // punctuation — the last so a URL written flush against Chinese prose
+  // ("链接https://x.com，谢谢") doesn't swallow the trailing sentence.
+  const urlRegex = /https?:\/\/[^\s"'<>，。、！？；：）（【】「」『』《》]+/g;
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const raw of text.match(urlRegex) ?? []) {
+    const url = trimUrlTrailingPunctuation(raw);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
+}
+
+/**
+ * Resolve free-form text to the URL strings a user meant to add: every
+ * scheme-anchored URL via {@link extractUrlsFromText}, OR — when the text is a
+ * single bare token with no scheme (e.g. "youtube.com/watch?v=x") — that one
+ * host. The single-token fallback keeps the convenience of typing one URL
+ * without a scheme, while a pasted blob (which has whitespace) never triggers it,
+ * so prose can't smuggle bare-host garbage in.
+ */
+export function resolveInputUrls(text: string): string[] {
+  const extracted = extractUrlsFromText(text);
+  if (extracted.length > 0) return extracted;
+  const single = text.trim();
+  return single && !/\s/.test(single) && isValidUrl(single) ? [single] : [];
+}
+
+/**
+ * Parse free-form text (single URL, or batch paste) into deduplicated
+ * {@link UrlItem}s. `existingUrls` (raw or normalized) are excluded so re-adding
+ * a URL already in the list is a no-op. Dedup is by normalized URL. Shared by
+ * {@link UrlTagInput}, the home/Manage `+URL` flows, and the project URL field,
+ * so all classify and normalize input identically.
+ */
+export function parseUrlsFromText(text: string, existingUrls: string[] = []): UrlItem[] {
+  const seen = new Set(existingUrls.map(normalizeUrl));
+  const items: UrlItem[] = [];
+  for (const raw of resolveInputUrls(text)) {
+    const item = createUrlItem(raw);
+    if (seen.has(item.url)) continue;
+    seen.add(item.url);
+    items.push(item);
+  }
+  return items;
+}
+
+/**
  * Parse ProjectConfig's webUrls + youtubeUrls newline strings into UrlItem[].
  *
  * Web items come first (preserving order), then YouTube items (preserving order).

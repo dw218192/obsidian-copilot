@@ -1,0 +1,306 @@
+import type { ProjectConfig } from "@/aiParams";
+import type { ProcessingItem } from "@/components/project/processingAdapter";
+import { AddUrlPopover } from "@/components/project/AddUrlPopover";
+import { UrlInputRow } from "@/components/project/UrlInputRow";
+import { UrlTypeIcon } from "@/components/project/UrlTypeIcon";
+import { useAgentProcessingItems } from "@/components/project/useAgentProcessingItems";
+import { TruncatedText } from "@/components/TruncatedText";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import { getCachedProjectRecordById } from "@/projects/state";
+import { openAgentCachedItemPreview } from "@/utils/cacheFileOpener";
+import type { UrlItem } from "@/utils/urlTagUtils";
+import {
+  AlertCircle,
+  ArrowUpRight,
+  CheckCircle2,
+  Clock,
+  Globe,
+  Link,
+  Loader2,
+  PlusCircle,
+  X,
+  Youtube,
+} from "lucide-react";
+import { App } from "obsidian";
+import React, { useMemo } from "react";
+
+/** The three Links-related selections in the Manage sidebar. */
+export type LinksSection = "links" | "web" | "youtube";
+
+interface LinksSidebarSectionProps {
+  activeSection: string | null;
+  webCount: number;
+  youtubeCount: number;
+  onSelect: (section: LinksSection) => void;
+  /** Saved URLs so the +URL popover dedups re-adds. */
+  existingUrls: string[];
+  /** Parsed, deduped URLs from the +URL popover → merge into the draft. */
+  onAddUrls: (urls: UrlItem[]) => void;
+  /** Portal target for the +URL popover (the Manage modal's contentEl). */
+  popoverContainer?: HTMLElement | null;
+}
+
+/**
+ * Left-sidebar "Links" group (design M): a cyan parent "Links" + Web / YouTube
+ * children with counts. Clicking the parent lists both groups on the right;
+ * clicking a child filters to that one. Mirrors the existing file sections'
+ * look (hover + active highlight) without reaching into the modal's private
+ * SectionHeader.
+ */
+export function LinksSidebarSection({
+  activeSection,
+  webCount,
+  youtubeCount,
+  onSelect,
+  existingUrls,
+  onAddUrls,
+  popoverContainer,
+}: LinksSidebarSectionProps) {
+  return (
+    <div>
+      <div
+        className={cn(
+          "tw-mb-1 tw-flex tw-cursor-pointer tw-items-center tw-rounded-md tw-p-2 hover:tw-bg-secondary/50",
+          activeSection === "links" && "tw-bg-secondary"
+        )}
+        onClick={() => onSelect("links")}
+      >
+        <Link className="tw-mr-2 tw-size-4 tw-text-context-manager-cyan" />
+        <h3 className="tw-text-sm tw-font-semibold tw-text-context-manager-cyan">Links</h3>
+        <AddUrlPopover
+          existingUrls={existingUrls}
+          onAdd={onAddUrls}
+          container={popoverContainer}
+          trigger={
+            <Button
+              variant="ghost"
+              size="fit"
+              className="tw-ml-auto tw-text-muted hover:tw-bg-secondary"
+              title="Add link"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <PlusCircle className="tw-size-4 tw-text-context-manager-cyan" />
+            </Button>
+          }
+        />
+      </div>
+      <LinkSubItem
+        Icon={Globe}
+        label="Web"
+        count={webCount}
+        active={activeSection === "web"}
+        onClick={() => onSelect("web")}
+      />
+      <LinkSubItem
+        Icon={Youtube}
+        label="YouTube"
+        count={youtubeCount}
+        active={activeSection === "youtube"}
+        onClick={() => onSelect("youtube")}
+      />
+    </div>
+  );
+}
+
+function LinkSubItem({
+  Icon,
+  label,
+  count,
+  active,
+  onClick,
+}: {
+  Icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "tw-flex tw-cursor-pointer tw-items-center tw-gap-2 tw-rounded-md tw-py-1.5 tw-pl-6 tw-pr-2 tw-text-sm hover:tw-bg-secondary/50",
+        active && "tw-bg-secondary tw-text-normal"
+      )}
+      onClick={onClick}
+    >
+      <Icon className="tw-size-4 tw-text-context-manager-cyan" />
+      <span className="tw-flex-1">{label}</span>
+      <span className="tw-text-xs tw-text-faint">{count}</span>
+    </div>
+  );
+}
+
+interface LinksContentPanelProps {
+  app: App;
+  /** Persisted project — drives the per-URL conversion status + preview path. */
+  project: ProjectConfig;
+  urlItems: UrlItem[];
+  filter: LinksSection;
+  onAddText: (text: string) => void;
+  onRemove: (id: string) => void;
+}
+
+/**
+ * Right-pane Links editor (design M): a unified URL input + clipboard paste at
+ * the top (auto web/youtube classification via the shared parser, delegated to
+ * `onAddText`), then the URLs grouped under Web / YouTube labels with a
+ * max-height scroll. Each row shows its conversion status badge + a preview
+ * arrow (converted snapshot) + a hover delete.
+ *
+ * This panel renders ONLY when Links is selected (agent `enableLinks`), so
+ * reading the agent pipeline's status here never runs on the CAG path. Status
+ * reflects the SAVED config — a freshly typed (unsaved) URL has no status yet.
+ */
+export function LinksContentPanel({
+  app,
+  project,
+  urlItems,
+  filter,
+  onAddText,
+  onRemove,
+}: LinksContentPanelProps) {
+  const { items } = useAgentProcessingItems(app, project, project.contextSource);
+  // Key by (cacheKind, url), not url alone: the same URL can be configured as
+  // BOTH a web and a youtube source, which the processing adapter emits as two
+  // distinct items sharing one `id` (see agentProcessingAdapter's same-URL pair
+  // contract). Keying on url alone would let one kind's status/snapshot clobber
+  // the other's — this matches how the canonical processing-status list keys its
+  // rows (`${cacheKind}:${id}`).
+  const statusByKey = useMemo(() => {
+    const map = new Map<string, ProcessingItem>();
+    for (const item of items) {
+      if (item.source === "url") map.set(`${item.cacheKind}:${item.id}`, item);
+    }
+    return map;
+  }, [items]);
+
+  const handlePreview = (item: ProcessingItem) => {
+    const record = getCachedProjectRecordById(project.id);
+    if (!record) return;
+    const slash = record.filePath.lastIndexOf("/");
+    const projectFolder = slash >= 0 ? record.filePath.slice(0, slash) : "";
+    void openAgentCachedItemPreview(app, projectFolder, item);
+  };
+
+  const webItems = urlItems.filter((u) => u.type === "web");
+  const youtubeItems = urlItems.filter((u) => u.type === "youtube");
+  const showWeb = filter === "links" || filter === "web";
+  const showYoutube = filter === "links" || filter === "youtube";
+
+  return (
+    // tw-p-0.5: the host ScrollArea viewport is `overflow-hidden`, so the URL
+    // input's focus ring (a 1px box-shadow) would be clipped along the top/left
+    // edge where the content sits flush against the viewport. A 2px inset keeps
+    // the ring fully visible without shifting the layout perceptibly.
+    <div className="tw-flex tw-flex-col tw-gap-2 tw-p-0.5">
+      <UrlInputRow onSubmit={onAddText} placeholder="Enter URL / YouTube and press Enter…" />
+
+      <div className="tw-max-h-[300px] tw-overflow-y-auto">
+        {showWeb && webItems.length > 0 && (
+          <UrlGroup
+            label="Web"
+            type="web"
+            items={webItems}
+            statusByKey={statusByKey}
+            onRemove={onRemove}
+            onPreview={handlePreview}
+          />
+        )}
+        {showYoutube && youtubeItems.length > 0 && (
+          <UrlGroup
+            label="YouTube"
+            type="youtube"
+            items={youtubeItems}
+            statusByKey={statusByKey}
+            onRemove={onRemove}
+            onPreview={handlePreview}
+          />
+        )}
+        {((showWeb && webItems.length > 0) || (showYoutube && youtubeItems.length > 0)) ===
+          false && (
+          <div className="tw-py-6 tw-text-center tw-text-sm tw-text-muted">
+            No links yet. Paste or type a URL above.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Per-URL conversion status glyph (design M badges). `null` for unstarted /
+ * unsaved URLs (no row badge). */
+function UrlStatusIcon({ status }: { status: ProcessingItem["status"] }) {
+  switch (status) {
+    case "ready":
+      return <CheckCircle2 className="tw-size-3.5 tw-text-success" />;
+    case "processing":
+      return <Loader2 className="tw-size-3.5 tw-animate-spin tw-text-accent" />;
+    case "pending":
+      return <Clock className="tw-size-3.5 tw-text-faint" />;
+    case "failed":
+      return <AlertCircle className="tw-size-3.5 tw-text-error" />;
+    default:
+      return null;
+  }
+}
+
+function UrlGroup({
+  label,
+  type,
+  items,
+  statusByKey,
+  onRemove,
+  onPreview,
+}: {
+  label: string;
+  type: "web" | "youtube";
+  items: UrlItem[];
+  statusByKey: ReadonlyMap<string, ProcessingItem>;
+  onRemove: (id: string) => void;
+  onPreview: (item: ProcessingItem) => void;
+}) {
+  return (
+    <div className="tw-mb-2">
+      <div className="tw-mb-1.5 tw-mt-2 tw-flex tw-items-center tw-gap-1.5 tw-text-xs tw-font-bold tw-text-faint">
+        <UrlTypeIcon type={type} className="tw-size-3.5" />
+        {label} <span className="tw-font-medium">({items.length})</span>
+      </div>
+      {items.map((item) => {
+        const status = statusByKey.get(`${type}:${item.url}`);
+        const isReady = status?.status === "ready";
+        return (
+          <div
+            key={item.id}
+            className="tw-group tw-mb-1.5 tw-flex tw-items-center tw-gap-2.5 tw-rounded-lg tw-border tw-border-solid tw-border-border tw-px-3 tw-py-2"
+          >
+            <UrlTypeIcon type={item.type} className="tw-size-4 tw-shrink-0" />
+            <TruncatedText className="tw-min-w-0 tw-flex-1 tw-text-sm" tooltipContent={item.url}>
+              {item.url.replace(/^https?:\/\//, "")}
+            </TruncatedText>
+            {isReady && status && (
+              <ArrowUpRight
+                className="tw-size-4 tw-shrink-0 tw-cursor-pointer tw-text-faint tw-opacity-0 hover:tw-text-normal group-hover:tw-opacity-100"
+                onClick={() => onPreview(status)}
+                aria-label="View converted content"
+              />
+            )}
+            {status && (
+              // Success rests hidden (revealed on row hover); processing / queued /
+              // failed stay visible since they need attention.
+              <span
+                className={cn("tw-shrink-0", isReady && "tw-opacity-0 group-hover:tw-opacity-100")}
+              >
+                <UrlStatusIcon status={status.status} />
+              </span>
+            )}
+            <X
+              className="tw-size-4 tw-shrink-0 tw-cursor-pointer tw-text-faint tw-opacity-0 hover:tw-text-error group-hover:tw-opacity-100"
+              onClick={() => onRemove(item.id)}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}

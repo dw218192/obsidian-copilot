@@ -127,6 +127,8 @@ export interface ChatInputProps {
   onRemoveSelectedText?: (id: string) => void;
   showProgressCard: () => void;
   showIndexingCard?: () => void;
+  /** Agent Mode project-context status icon, rendered in the context badge row. */
+  contextStatusIndicator?: React.ReactNode;
 
   /**
    * Render slot for the toggle row that sits next to the send button.
@@ -209,6 +211,7 @@ const ChatInput = React.forwardRef<ChatInputHandle, ChatInputProps>(function Cha
     onRemoveSelectedText,
     showProgressCard,
     showIndexingCard,
+    contextStatusIndicator,
     toolControls,
     onToolPillsChange,
     onTagSelected,
@@ -756,6 +759,8 @@ const ChatInput = React.forwardRef<ChatInputHandle, ChatInputProps>(function Cha
           onAddToContext={handleAddToContext}
           onRemoveFromContext={handleRemoveFromContext}
           hideAddContextButton={isAgentMode}
+          statusIndicator={contextStatusIndicator}
+          isAgentMode={isAgentMode}
         />
       )}
 

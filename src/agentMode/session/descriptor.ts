@@ -152,7 +152,7 @@ export interface BackendDescriptor {
    *
    * When false (codex, Claude Code), the backend has no usable title source:
    * codex names a session after the raw first prompt, leaking the injected
-   * `<copilot-context>` envelope, and the Claude SDK exposes no title API. For
+   * `<attached_context>` envelope, and the Claude SDK exposes no title API. For
    * these the session derives the tab title client-side from the user's first
    * visible message and ignores any backend-provided title.
    *
