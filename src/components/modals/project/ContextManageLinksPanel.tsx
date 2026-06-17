@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { getCachedProjectRecordById } from "@/projects/state";
 import { openAgentCachedItemPreview } from "@/utils/cacheFileOpener";
-import type { UrlItem } from "@/utils/urlTagUtils";
+import type { UrlItem, UrlKind } from "@/utils/urlTagUtils";
 import {
   AlertCircle,
   ArrowUpRight,
@@ -242,7 +242,7 @@ function UrlGroup({
   onPreview,
 }: {
   label: string;
-  type: "web" | "youtube";
+  type: UrlKind;
   items: UrlItem[];
   statusByKey: ReadonlyMap<string, ProcessingItem>;
   onRemove: (id: string) => void;

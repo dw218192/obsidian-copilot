@@ -1,5 +1,6 @@
 import { err2String } from "@/errorFormat";
 import { logWarn } from "@/logger";
+import type { UrlKind } from "@/utils/urlTagUtils";
 import type { ContextCacheFs } from "./contextCacheFs";
 
 /** Source kinds that get materialized into `.context-cache/` as text snapshots.
@@ -11,7 +12,7 @@ export type MaterializedSourceType = (typeof MATERIALIZED_SOURCE_TYPES)[number];
 
 /** A URL or YouTube link to fetch via brevilabs primitives. */
 export interface RemoteSource {
-  type: "web" | "youtube";
+  type: UrlKind;
   /** The configured URL — also the cache key and fingerprint basis. */
   url: string;
 }

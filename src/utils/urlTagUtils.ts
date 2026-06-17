@@ -11,10 +11,17 @@
 
 import { getYouTubeVideoId } from "@/utils/youtubeUrl";
 
+/**
+ * The two kinds a context URL can be classified as. Single source of truth —
+ * every URL surface (input, icon, status, cache remote) derives from this so a
+ * new kind is added in one place.
+ */
+export type UrlKind = "web" | "youtube";
+
 export interface UrlItem {
   id: string;
   url: string;
-  type: "web" | "youtube";
+  type: UrlKind;
 }
 
 /**
@@ -23,7 +30,7 @@ export interface UrlItem {
  * re-parsed from strings on every render. A deterministic ID based on
  * the URL content ensures stable keys and prevents unnecessary re-mounts.
  */
-function stableId(type: "web" | "youtube", url: string): string {
+function stableId(type: UrlKind, url: string): string {
   return `${type}:${url}`;
 }
 
@@ -35,7 +42,7 @@ function stableId(type: "web" | "youtube", url: string): string {
  * "youtube". Non-video YouTube pages (channels, playlists, homepage) correctly
  * fall through to "web", matching the downstream transcript pipeline expectation.
  */
-export function detectUrlType(url: string): "web" | "youtube" {
+export function detectUrlType(url: string): UrlKind {
   // Reason: User input may omit the protocol (e.g. "youtube.com/watch?v=...").
   // getYouTubeVideoId requires a full URL for `new URL()` parsing.
   const normalized = url.startsWith("http") ? url : `https://${url}`;
@@ -162,7 +169,7 @@ export function parseProjectUrls(webUrls: string, youtubeUrls: string): UrlItem[
   const seen = new Set<string>();
   const items: UrlItem[] = [];
 
-  const parseField = (raw: string, type: "web" | "youtube") => {
+  const parseField = (raw: string, type: UrlKind) => {
     if (!raw) return;
     const lines = raw.split("\n");
     for (const line of lines) {
