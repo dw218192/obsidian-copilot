@@ -316,18 +316,49 @@ function escapeXmlMinimal(s: string): string {
 
 /**
  * Read the current (visible) page number of the open PDF view showing `file`.
- * Uses Obsidian's internal PDF viewer state, so it's defensive about shape.
+ *
+ * Tries Obsidian's internal pdf.js viewer state first (shape varies by version),
+ * then falls back to DOM geometry — the most-visible rendered `.page` in the
+ * scroll viewport — which is stable across versions.
  */
 function getActivePdfCurrentPage(file: TFile): number | null {
   for (const leaf of app.workspace.getLeavesOfType("pdf")) {
     const view = leaf.view as unknown as {
       file?: { path?: string };
-      viewer?: { child?: { pdfViewer?: { currentPageNumber?: number } } };
+      containerEl?: HTMLElement;
+      viewer?: { child?: { pdfViewer?: unknown } };
     };
-    if (view?.file?.path === file.path) {
-      const n = view?.viewer?.child?.pdfViewer?.currentPageNumber;
-      if (typeof n === "number" && n >= 1) return n;
-    }
+    if (view?.file?.path !== file.path) continue;
+
+    // Fast path: internal pdf.js PDFViewer.currentPageNumber (possibly nested).
+    const pv = view?.viewer?.child?.pdfViewer as
+      | { currentPageNumber?: number; pdfViewer?: { currentPageNumber?: number } }
+      | undefined;
+    const internal = pv?.currentPageNumber ?? pv?.pdfViewer?.currentPageNumber;
+    if (typeof internal === "number" && internal >= 1) return internal;
+
+    // Fallback: most-visible page by geometry.
+    const containerEl = view.containerEl;
+    if (!containerEl) continue;
+    const viewerEl = containerEl.querySelector<HTMLElement>(".pdf-viewer-container") ?? containerEl;
+    const viewRect = viewerEl.getBoundingClientRect();
+    let bestPage: number | null = null;
+    let bestVisible = 0;
+    viewerEl.querySelectorAll<HTMLElement>(".page[data-page-number]").forEach((pageEl) => {
+      const r = pageEl.getBoundingClientRect();
+      const visible = Math.max(
+        0,
+        Math.min(r.bottom, viewRect.bottom) - Math.max(r.top, viewRect.top)
+      );
+      if (visible > bestVisible) {
+        const n = parseInt(pageEl.getAttribute("data-page-number") || "", 10);
+        if (!Number.isNaN(n)) {
+          bestVisible = visible;
+          bestPage = n;
+        }
+      }
+    });
+    if (bestPage !== null && bestPage >= 1) return bestPage;
   }
   return null;
 }
@@ -345,21 +376,29 @@ export async function buildActivePdfPageContextBlock(
   if (!activeFile || activeFile.extension !== "pdf") return "";
   const page = getActivePdfCurrentPage(activeFile);
   if (!page) return "";
+
+  // Page number is known from the DOM; text extraction (needs pdf.js) is best-effort.
+  let content = "";
+  let totalPages: number | null = null;
   try {
     const { handle, key } = await getDoc(activeFile);
-    if (page > handle.numPages) return "";
-    const text = (await cachedPageText(handle, key, page)).trim();
-    if (text.length === 0) return ""; // scanned / no text layer
-    const capped =
-      text.length > ACTIVE_PDF_PAGE_MAX_CHARS
-        ? text.slice(0, ACTIVE_PDF_PAGE_MAX_CHARS) + "\n…[truncated]"
-        : text;
-    return (
-      `\n\n<active_pdf_page>\n<path>${activeFile.path}</path>\n<page>${page}</page>\n` +
-      `<total_pages>${handle.numPages}</total_pages>\n<content>\n${escapeXmlMinimal(capped)}\n</content>\n</active_pdf_page>`
-    );
+    totalPages = handle.numPages;
+    if (page <= handle.numPages) {
+      const text = (await cachedPageText(handle, key, page)).trim();
+      if (text.length > 0) {
+        content =
+          text.length > ACTIVE_PDF_PAGE_MAX_CHARS
+            ? text.slice(0, ACTIVE_PDF_PAGE_MAX_CHARS) + "\n…[truncated]"
+            : text;
+      }
+    }
   } catch (err) {
-    logError("[pdfTools] Failed to build active PDF page context", err);
-    return "";
+    logError("[pdfTools] Failed to extract active PDF page text", err);
   }
+
+  const totalAttr = totalPages ? `<total_pages>${totalPages}</total_pages>\n` : "";
+  const body = content
+    ? `<content>\n${escapeXmlMinimal(content)}\n</content>\n`
+    : `<note>Page text unavailable (scanned page or no text layer). Ask the user to snip this page for a vision read.</note>\n`;
+  return `\n\n<active_pdf_page>\n<path>${activeFile.path}</path>\n<page>${page}</page>\n${totalAttr}${body}</active_pdf_page>`;
 }
