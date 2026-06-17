@@ -14,6 +14,7 @@ import {
   obsidianTasksTool,
   obsidianTemplatesTool,
 } from "./ObsidianCliTools";
+import { pdfInfoTool, pdfReadPagesTool, pdfSearchTool, pdfTocTool } from "./pdf/pdfTools";
 import { localSearchTool, webSearchTool } from "./SearchTools";
 import { createGetTagListTool } from "./TagTools";
 import {
@@ -221,6 +222,54 @@ Example: Add "Bob Johnson" to attendees in notes/meeting.md:
 path: "notes/meeting.md"
 oldText: "## Attendees\\n- John Smith\\n- Jane Doe"
 newText: "## Attendees\\n- John Smith\\n- Jane Doe\\n- Bob Johnson"`,
+    },
+  },
+
+  // PDF tools (on-demand, local — read pages/TOC/search without inlining the whole PDF)
+  {
+    tool: pdfInfoTool,
+    metadata: {
+      id: "pdfInfo",
+      displayName: "PDF Info",
+      description: "Get a PDF's page count, table of contents availability, and scanned status",
+      category: "file",
+      requiresVault: true,
+      copilotCommands: ["@pdf"],
+      customPromptInstructions: `For pdf_info / pdf_toc / pdf_search / pdf_read_pages:
+- These let you read a PDF on demand instead of loading the whole document. Use them for large PDFs.
+- Omit "path" to act on the PDF the user currently has open; otherwise pass its vault path or name.
+- Workflow: call pdf_info first (size + whether it's scanned), then pdf_toc and/or pdf_search to locate the relevant pages, then pdf_read_pages to read only those pages.
+- If a PDF appears scanned or pages return little text, the text tools won't help — tell the user to snip the region (or render it) so a vision model can read the image.`,
+    },
+  },
+  {
+    tool: pdfTocTool,
+    metadata: {
+      id: "pdfToc",
+      displayName: "PDF Table of Contents",
+      description: "Read a PDF's outline/bookmarks with page numbers",
+      category: "file",
+      requiresVault: true,
+    },
+  },
+  {
+    tool: pdfSearchTool,
+    metadata: {
+      id: "pdfSearch",
+      displayName: "PDF Search",
+      description: "Find query terms inside a PDF and return matching pages with snippets",
+      category: "file",
+      requiresVault: true,
+    },
+  },
+  {
+    tool: pdfReadPagesTool,
+    metadata: {
+      id: "pdfReadPages",
+      displayName: "PDF Read Pages",
+      description: "Read the text of specific PDF pages (range, list, single, or all)",
+      category: "file",
+      requiresVault: true,
     },
   },
 
