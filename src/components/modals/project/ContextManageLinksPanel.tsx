@@ -1,7 +1,6 @@
 import type { ProjectConfig } from "@/aiParams";
 import type { ProcessingItem } from "@/components/project/processingAdapter";
 import { AddUrlPopover } from "@/components/project/AddUrlPopover";
-import { UrlInputRow } from "@/components/project/UrlInputRow";
 import { UrlTypeIcon } from "@/components/project/UrlTypeIcon";
 import { useAgentProcessingItems } from "@/components/project/useAgentProcessingItems";
 import { TruncatedText } from "@/components/TruncatedText";
@@ -137,27 +136,25 @@ interface LinksContentPanelProps {
   project: ProjectConfig;
   urlItems: UrlItem[];
   filter: LinksSection;
-  onAddText: (text: string) => void;
   onRemove: (id: string) => void;
 }
 
 /**
- * Right-pane Links editor (design M): a unified URL input + clipboard paste at
- * the top (auto web/youtube classification via the shared parser, delegated to
- * `onAddText`), then the URLs grouped under Web / YouTube labels with a
- * max-height scroll. Each row shows its conversion status badge + a preview
- * arrow (converted snapshot) + a hover delete.
+ * Right-pane Links viewer: the saved URLs grouped under Web / YouTube labels.
+ * Each row shows its conversion status badge + a preview arrow (converted
+ * snapshot) + a hover delete. Adding is handled solely by the sidebar's "+"
+ * popover, matching every other context type (Tags / Folders / Files), whose
+ * right pane is a pure list with no inline add affordance.
  *
  * This panel renders ONLY when Links is selected (agent `enableLinks`), so
  * reading the agent pipeline's status here never runs on the CAG path. Status
- * reflects the SAVED config — a freshly typed (unsaved) URL has no status yet.
+ * reflects the SAVED config — a freshly added (unsaved) URL has no status yet.
  */
 export function LinksContentPanel({
   app,
   project,
   urlItems,
   filter,
-  onAddText,
   onRemove,
 }: LinksContentPanelProps) {
   const { items } = useAgentProcessingItems(app, project, project.contextSource);
@@ -189,41 +186,32 @@ export function LinksContentPanel({
   const showYoutube = filter === "links" || filter === "youtube";
 
   return (
-    // tw-p-0.5: the host ScrollArea viewport is `overflow-hidden`, so the URL
-    // input's focus ring (a 1px box-shadow) would be clipped along the top/left
-    // edge where the content sits flush against the viewport. A 2px inset keeps
-    // the ring fully visible without shifting the layout perceptibly.
-    <div className="tw-flex tw-flex-col tw-gap-2 tw-p-0.5">
-      <UrlInputRow onSubmit={onAddText} placeholder="Enter URL / YouTube and press Enter…" />
-
-      <div className="tw-max-h-[300px] tw-overflow-y-auto">
-        {showWeb && webItems.length > 0 && (
-          <UrlGroup
-            label="Web"
-            type="web"
-            items={webItems}
-            statusByKey={statusByKey}
-            onRemove={onRemove}
-            onPreview={handlePreview}
-          />
-        )}
-        {showYoutube && youtubeItems.length > 0 && (
-          <UrlGroup
-            label="YouTube"
-            type="youtube"
-            items={youtubeItems}
-            statusByKey={statusByKey}
-            onRemove={onRemove}
-            onPreview={handlePreview}
-          />
-        )}
-        {((showWeb && webItems.length > 0) || (showYoutube && youtubeItems.length > 0)) ===
-          false && (
-          <div className="tw-py-6 tw-text-center tw-text-sm tw-text-muted">
-            No links yet. Paste or type a URL above.
-          </div>
-        )}
-      </div>
+    <div className="tw-flex tw-flex-col tw-gap-2">
+      {showWeb && webItems.length > 0 && (
+        <UrlGroup
+          label="Web"
+          type="web"
+          items={webItems}
+          statusByKey={statusByKey}
+          onRemove={onRemove}
+          onPreview={handlePreview}
+        />
+      )}
+      {showYoutube && youtubeItems.length > 0 && (
+        <UrlGroup
+          label="YouTube"
+          type="youtube"
+          items={youtubeItems}
+          statusByKey={statusByKey}
+          onRemove={onRemove}
+          onPreview={handlePreview}
+        />
+      )}
+      {((showWeb && webItems.length > 0) || (showYoutube && youtubeItems.length > 0)) === false && (
+        <div className="tw-py-6 tw-text-center tw-text-sm tw-text-muted">
+          No links yet. Use the + next to Links in the sidebar to add one.
+        </div>
+      )}
     </div>
   );
 }

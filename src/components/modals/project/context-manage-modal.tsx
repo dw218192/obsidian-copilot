@@ -1531,7 +1531,6 @@ function ContextManage({
                   project={initialProject}
                   urlItems={contextUrls.urlItems}
                   filter={activeSection}
-                  onAddText={contextUrls.addFromText}
                   onRemove={contextUrls.removeUrl}
                 />
               ) : getDisplayItems.length === 0 ? (
