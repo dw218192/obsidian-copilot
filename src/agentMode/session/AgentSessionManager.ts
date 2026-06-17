@@ -1454,6 +1454,27 @@ export class AgentSessionManager {
     this.activeProjectId = projectId;
   }
 
+  /**
+   * Undo the optimistic scope switch a history load performs before it has a
+   * session, when the resume/create that follows rejects. A history load calls
+   * `setActiveScope` to point `activeProjectId` at the chat's scope (so the new
+   * session activates there) while `activeSessionId` still references the
+   * previous scope's session; a failed load would otherwise strand the manager
+   * with `getActiveSession().projectId !== activeProjectId` until the user
+   * manually switches scopes. Only roll back if we're still parked in the scope
+   * we switched to — a concurrent scope switch during the awaited backend spawn
+   * means the user has moved on, and forcing them back would reintroduce the
+   * very race `createSession`'s activation guard already avoids.
+   */
+  private rollbackHistoryLoadScope(
+    attemptedProjectId: ProjectScopeId,
+    previousProjectId: ProjectScopeId
+  ): void {
+    if (this.activeProjectId === attemptedProjectId) {
+      this.activeProjectId = previousProjectId;
+    }
+  }
+
   setDefaultBackend(backendId: BackendId): void {
     if (getSettings().agentMode?.activeBackend === backendId) return;
     setSettings((cur) => ({
@@ -2077,19 +2098,27 @@ export class AgentSessionManager {
     }
     // Point the active scope at the chat's scope before constructing its
     // session (which then activates within that scope). No restore/spawn here —
-    // we create the specific saved session next.
+    // we create the specific saved session next. Snapshot the scope this call
+    // actually replaces right here, AFTER the awaits above — capturing earlier
+    // would let a scope switch raced in during `loadFile` make rollback restore
+    // a stale scope.
+    const previousActiveProjectId = this.activeProjectId;
     this.setActiveScope(projectId);
 
-    let session: AgentSession | null = null;
-    if (loaded.sessionId) {
-      session = await this.tryResumeSessionFromHistory(
-        loaded.backendId,
-        loaded.sessionId,
-        projectId
-      );
-    }
-    if (!session) {
-      session = await this.createSession(loaded.backendId, projectId);
+    // Resume or create the saved session. Either await can reject (e.g. a
+    // missing backend binary fails to spawn); on failure, undo the scope switch
+    // above so a failed open doesn't leave the active scope ahead of the active
+    // session. The throw points are all before a session activates, so no
+    // already-active session in the target scope can be wrongly rolled back.
+    let session: AgentSession;
+    try {
+      const resumed = loaded.sessionId
+        ? await this.tryResumeSessionFromHistory(loaded.backendId, loaded.sessionId, projectId)
+        : null;
+      session = resumed ?? (await this.createSession(loaded.backendId, projectId));
+    } catch (err) {
+      this.rollbackHistoryLoadScope(projectId, previousActiveProjectId);
+      throw err;
     }
 
     session.loadDisplayMessages(loaded.messages);
@@ -2169,10 +2198,25 @@ export class AgentSessionManager {
       new Notice("This chat belongs to a project that no longer exists.");
       throw new OrphanedProjectError(projectId);
     }
+    // Snapshot the scope this call actually replaces right here, AFTER the
+    // `getEntry` await — capturing earlier would let a scope switch raced in
+    // during the await make rollback restore a stale scope.
+    const previousActiveProjectId = this.activeProjectId;
     this.setActiveScope(projectId);
-    const session = await this.tryResumeSessionFromHistory(backendId, sessionId, projectId);
-    if (!session) {
-      throw new Error(`Could not resume session ${sessionId} from the ${backendId} session store.`);
+    // Unlike markdown history there is no fresh-session fallback — a failed
+    // resume rejects, so undo the scope switch above before propagating it.
+    let session: AgentSession;
+    try {
+      const resumed = await this.tryResumeSessionFromHistory(backendId, sessionId, projectId);
+      if (!resumed) {
+        throw new Error(
+          `Could not resume session ${sessionId} from the ${backendId} session store.`
+        );
+      }
+      session = resumed;
+    } catch (err) {
+      this.rollbackHistoryLoadScope(projectId, previousActiveProjectId);
+      throw err;
     }
     // Rebuild the visible transcript for backends that resume without
     // replaying it (Claude SDK reads its on-disk session jsonl). ACP backends

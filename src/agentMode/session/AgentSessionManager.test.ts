@@ -1989,6 +1989,23 @@ describe("AgentSessionManager.enterProject MRU touch", () => {
     expect(mockTouchProjectLastUsed).toHaveBeenCalledWith(OTHER_ID);
     expect(mockTouchProjectLastUsed).not.toHaveBeenCalledWith(PROJECT_ID);
   });
+
+  it("rolls the active scope back when a cross-scope history load fails to resume", async () => {
+    const mgr = buildManager();
+    // The active session lives in the project scope.
+    await mgr.enterProject(PROJECT_ID);
+    const projectSession = mgr.getActiveSession();
+    expect(mgr.getActiveProjectId()).toBe(PROJECT_ID);
+
+    // Opening a global native chat on an unresolvable backend switches the
+    // active scope to global first, then rejects because the resume can't
+    // start. The failure must restore the project scope — otherwise the active
+    // scope and the (unchanged) active session would disagree.
+    await expect(mgr.loadNativeSessionFromHistory("codex", "missing")).rejects.toThrow();
+
+    expect(mgr.getActiveProjectId()).toBe(PROJECT_ID);
+    expect(mgr.getActiveSession()).toBe(projectSession);
+  });
 });
 
 describe("AgentSessionManager fresh-visit tab detach", () => {
