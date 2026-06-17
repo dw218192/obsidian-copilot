@@ -87,11 +87,22 @@ export function isPlusModel(modelKey: string): boolean {
 }
 
 /**
+ * Fork-local override: this is a self-hosted build that uses the user's own LLM
+ * endpoint, so the client-side Plus gate (which only blocks LOCAL features like
+ * agent mode and tool calling) is bypassed. This does NOT unlock Brevilabs
+ * server-backed features (pdf4llm, web search, Plus models/embeddings) — those
+ * validate the license server-side and will still fail. Set to false to restore
+ * upstream gating. Not for upstreaming.
+ */
+const FORK_UNLOCK_PLUS: boolean = true;
+
+/**
  * Synchronous check if Plus features should be enabled.
  * Returns true when self-host mode is valid OR user has valid Plus subscription.
  * Use this for synchronous checks (e.g., model validation, UI state).
  */
 export function isPlusEnabled(): boolean {
+  if (FORK_UNLOCK_PLUS) return true;
   const settings = getSettings();
   // Self-host mode with valid plan validation bypasses Plus requirements
   if (isSelfHostModeValid()) {
@@ -106,6 +117,7 @@ export function isPlusEnabled(): boolean {
  */
 export function useIsPlusUser(): boolean | undefined {
   const settings = useSettingsValue();
+  if (FORK_UNLOCK_PLUS) return true;
   // Self-host mode with valid plan validation bypasses Plus requirements (requires license key)
   if (
     settings.plusLicenseKey &&
@@ -132,6 +144,7 @@ export function useIsPlusUser(): boolean | undefined {
 export async function checkIsPlusUser(
   context?: Record<string, unknown>
 ): Promise<boolean | undefined> {
+  if (FORK_UNLOCK_PLUS) return true;
   // Self-host mode with valid plan validation bypasses license check
   if (isSelfHostModeValid()) {
     return true;
