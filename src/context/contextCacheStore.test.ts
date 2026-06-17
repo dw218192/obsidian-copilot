@@ -42,8 +42,8 @@ function memFs(seed: Record<string, string> = {}): ContextCacheFs & { files: Map
 }
 
 const CACHE_DIR = "/vault/Proj/.context-cache";
-const TTL = 24 * 60 * 60 * 1000;
 const T0 = 1_700_000_000_000;
+const DAY = 24 * 60 * 60 * 1000;
 
 function converters(overrides: Partial<ContextConverters> = {}): ContextConverters {
   return {
@@ -78,7 +78,6 @@ describe("materializeSources", () => {
       remotes,
       files: [fileSource()],
       nowMs: T0,
-      ttlMs: TTL,
     });
 
     expect(entries).toHaveLength(3);
@@ -95,88 +94,65 @@ describe("materializeSources", () => {
     expect(body).toContain("content for https://a.com");
   });
 
-  it("cheap-skips unchanged sources within TTL (no re-fetch / re-parse)", async () => {
+  it("cheap-skips an unchanged successful source indefinitely (no re-fetch / re-parse)", async () => {
     const fs = memFs();
     const conv = converters();
     const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
     const file = fileSource();
 
-    await materializeSources({
-      cacheDir: CACHE_DIR,
-      fs,
-      converters: conv,
-      remotes,
-      files: [file],
-      nowMs: T0,
-      ttlMs: TTL,
-    });
-    // Second pass, same fingerprint, still inside TTL.
-    await materializeSources({
-      cacheDir: CACHE_DIR,
-      fs,
-      converters: conv,
-      remotes,
-      files: [file],
-      nowMs: T0 + TTL / 2,
-      ttlMs: TTL,
-    });
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [file], nowMs: T0 }); // prettier-ignore
+    // Second pass far in the future: a successful snapshot has no TTL, so its
+    // identity / fingerprint match still cheap-skips both the fetch and parse.
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [file], nowMs: T0 + 365 * DAY }); // prettier-ignore
 
     expect(conv.fetchRemote).toHaveBeenCalledTimes(1);
     expect(conv.parseFile).toHaveBeenCalledTimes(1);
-  });
-
-  it("re-fetches a remote after its TTL expires", async () => {
-    const fs = memFs();
-    const conv = converters();
-    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0 + TTL + 1, ttlMs: TTL }); // prettier-ignore
-
-    expect(conv.fetchRemote).toHaveBeenCalledTimes(2);
   });
 
   it("re-parses a file when its mtime/size fingerprint changes", async () => {
     const fs = memFs();
     const conv = converters();
 
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [], files: [fileSource({ mtime: 1000, size: 50 })], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [], files: [fileSource({ mtime: 2000, size: 50 })], nowMs: T0, ttlMs: TTL }); // prettier-ignore
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [], files: [fileSource({ mtime: 1000, size: 50 })], nowMs: T0 }); // prettier-ignore
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [], files: [fileSource({ mtime: 2000, size: 50 })], nowMs: T0 }); // prettier-ignore
 
     expect(conv.parseFile).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps the stale snapshot when a re-fetch fails", async () => {
+  it("keeps a stale file snapshot when a re-parse fails", async () => {
+    // Files are the kind whose fingerprint (`mtime:size`) routinely changes, so
+    // they are the practical way to reach the "kept-stale on re-fetch failure"
+    // path: a successful remote snapshot matches its identity fingerprint and is
+    // cheap-skipped, so it normally never re-fetches (a mismatched/legacy remote
+    // snapshot could still reach this path, but that's the rare edge, not the norm).
     const fs = memFs();
     const good = converters();
-    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: good, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    const fileName = [...fs.files.keys()].find((k) => k.includes("web-"))!;
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: good, remotes: [], files: [fileSource({ mtime: 1000, size: 50 })], nowMs: T0 }); // prettier-ignore
+    const fileName = [...fs.files.keys()].find((k) => k.includes("file-"))!;
     const staleBody = fs.files.get(fileName)!;
 
     const failing = converters({
-      fetchRemote: jest.fn(async () => {
-        throw new Error("network down");
+      parseFile: jest.fn(async () => {
+        throw new Error("bad parse");
       }),
     });
     const { entries, failures } = await materializeSources({
       cacheDir: CACHE_DIR,
       fs,
       converters: failing,
-      remotes,
-      files: [],
-      nowMs: T0 + TTL + 1, // force a refetch attempt
-      ttlMs: TTL,
+      remotes: [],
+      files: [fileSource({ mtime: 2000, size: 99 })], // edited → re-parse attempted
+      nowMs: T0 + 1,
     });
 
-    expect(failing.fetchRemote).toHaveBeenCalledTimes(1);
+    expect(failing.parseFile).toHaveBeenCalledTimes(1);
     expect(entries).toHaveLength(1); // stale entry still counts as present
     expect(fs.files.get(fileName)).toBe(staleBody); // content untouched
     // A kept-stale source is a failure flagged as still-usable (no missing source).
     expect(failures).toHaveLength(1);
-    expect(failures[0]).toMatchObject({ source: "https://a.com", kind: "web", usedStaleSnapshot: true }); // prettier-ignore
-    expect(failures[0].error).toContain("network down");
-    // No negative marker is written when a stale snapshot remains usable.
+    expect(failures[0]).toMatchObject({ source: "Proj/doc.pdf", kind: "file", usedStaleSnapshot: true }); // prettier-ignore
+    expect(failures[0].error).toContain("bad parse");
+    // No failure marker is written when a stale snapshot remains usable.
     expect([...fs.files.keys()].some((k) => k.includes("failed-"))).toBe(false);
   });
 
@@ -194,21 +170,20 @@ describe("materializeSources", () => {
       remotes: [{ type: "web", url: "https://a.com" }],
       files: [],
       nowMs: T0,
-      ttlMs: TTL,
     });
 
     expect(entries).toHaveLength(0);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ source: "https://a.com", kind: "web", usedStaleSnapshot: false }); // prettier-ignore
     expect(failures[0].error).toContain("boom");
-    // A negative marker IS written for a missing source, and it is wanted so a
-    // same-run reconcile keeps it.
+    // A failure marker IS written for a missing source, and it is wanted so a
+    // same-run reconcile keeps it (the status panel reads it to surface the error).
     const marker = [...fs.files.keys()].find((k) => k.includes("failed-web-"))!;
     expect(marker).toBeDefined();
     expect(wantedFileNames.has(marker.slice(`${CACHE_DIR}/`.length))).toBe(true);
   });
 
-  it("negative-cache skips a known-bad source within TTL (no re-fetch)", async () => {
+  it("cheap-skips a known-bad remote on the next automatic run (no re-fetch) but still surfaces it", async () => {
     const fs = memFs();
     const failing = converters({
       fetchRemote: jest.fn(async () => {
@@ -216,55 +191,27 @@ describe("materializeSources", () => {
       }),
     });
     const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    // Second run within TTL: should NOT re-fetch, but still report the failure.
-    const { failures } = await materializeSources({
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 }); // prettier-ignore
+    // Second automatic run: the failure marker is honored — no second fetch — yet
+    // the failure is still reported (and its marker kept) so the panel surfaces it.
+    const { failures, wantedFileNames } = await materializeSources({
       cacheDir: CACHE_DIR,
       fs,
       converters: failing,
       remotes,
       files: [],
-      nowMs: T0 + TTL / 2,
-      ttlMs: TTL,
+      nowMs: T0 + 1,
     });
 
-    expect(failing.fetchRemote).toHaveBeenCalledTimes(1); // skipped on the 2nd run
+    expect(failing.fetchRemote).toHaveBeenCalledTimes(1);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ source: "https://a.com", kind: "web", usedStaleSnapshot: false }); // prettier-ignore
     expect(failures[0].error).toContain("boom");
-  });
-
-  it("keeps the negative marker wanted on a TTL skip so reconcile can't delete it", async () => {
-    // Regression: the skip path must still mark the existing marker wanted.
-    // Production reconciles every run; without this the marker is deleted the
-    // same run it's honored, collapsing the 24h TTL to a single run.
-    const fs = memFs();
-    const failing = converters({
-      fetchRemote: jest.fn(async () => {
-        throw new Error("boom");
-      }),
-    });
-    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
     const markerKey = [...fs.files.keys()].find((k) => k.includes("failed-web-"))!;
-    expect(markerKey).toBeDefined();
-
-    // Second run within TTL (the skip path), then reconcile as production does.
-    const { wantedFileNames } = await materializeSources({
-      cacheDir: CACHE_DIR,
-      fs,
-      converters: failing,
-      remotes,
-      files: [],
-      nowMs: T0 + TTL / 2,
-      ttlMs: TTL,
-    });
     expect(wantedFileNames.has(markerKey.slice(`${CACHE_DIR}/`.length))).toBe(true);
-    await reconcileCache(fs, CACHE_DIR, wantedFileNames);
-    expect(fs.files.has(markerKey)).toBe(true); // survived — TTL still in force
   });
 
-  it("re-attempts a known-bad source after the failure TTL expires", async () => {
+  it("emits no itemStart/itemFailed for a cheap-skipped failed source", async () => {
     const fs = memFs();
     const failing = converters({
       fetchRemote: jest.fn(async () => {
@@ -272,50 +219,126 @@ describe("materializeSources", () => {
       }),
     });
     const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 + TTL + 1, ttlMs: TTL }); // prettier-ignore
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 }); // prettier-ignore
+    const events: MaterializeProgress[] = [];
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 + 1, onProgress: (p) => events.push(p) }); // prettier-ignore
+    // The cheap-skip is silent (symmetric with a successful cheap-skip): no
+    // per-source lifecycle events, only the step-count progress.
+    expect(events.some((p) => p.phase.startsWith("item"))).toBe(false);
+  });
+
+  it("re-fetches a known-bad remote when forceRetryFailed is set", async () => {
+    const fs = memFs();
+    const failing = converters({
+      fetchRemote: jest.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 }); // prettier-ignore
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 + 1, forceRetryFailed: true }); // prettier-ignore
 
     expect(failing.fetchRemote).toHaveBeenCalledTimes(2);
   });
 
-  it("re-attempts a failed file within TTL once its mtime:size changes", async () => {
-    // A file negative marker is keyed to the fingerprint at failure time; editing
-    // the file (new mtime:size) must re-attempt parsing, not stay skipped.
+  it("cheap-skips a known-bad file on the next automatic run while unchanged", async () => {
     const fs = memFs();
     const failing = converters({
       parseFile: jest.fn(async () => {
         throw new Error("bad parse");
       }),
     });
-    const first = fileSource({ mtime: 1000, size: 50 });
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [first], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    expect(failing.parseFile).toHaveBeenCalledTimes(1);
+    const file = fileSource({ mtime: 1000, size: 50 });
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [file], nowMs: T0 }); // prettier-ignore
+    const { failures } = await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [file], nowMs: T0 + 1 }); // prettier-ignore
 
-    // Unchanged file within TTL → skipped.
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [first], nowMs: T0 + 1, ttlMs: TTL }); // prettier-ignore
-    expect(failing.parseFile).toHaveBeenCalledTimes(1);
+    expect(failing.parseFile).toHaveBeenCalledTimes(1); // marker honored, no re-parse
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ source: "Proj/doc.pdf", kind: "file", usedStaleSnapshot: false }); // prettier-ignore
+  });
 
-    // Edited file (new mtime:size) within TTL → re-attempted despite the marker.
-    const edited = fileSource({ mtime: 2000, size: 99 });
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [edited], nowMs: T0 + 2, ttlMs: TTL }); // prettier-ignore
+  it("re-parses a known-bad file when its mtime/size fingerprint changes (marker stale)", async () => {
+    const fs = memFs();
+    const failing = converters({
+      parseFile: jest.fn(async () => {
+        throw new Error("bad parse");
+      }),
+    });
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [fileSource({ mtime: 1000, size: 50 })], nowMs: T0 }); // prettier-ignore
+    // The file was edited (new mtime/size) after it failed: the marker's
+    // fingerprint no longer matches, so it's re-attempted rather than skipped.
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [fileSource({ mtime: 2000, size: 99 })], nowMs: T0 + 1 }); // prettier-ignore
+
     expect(failing.parseFile).toHaveBeenCalledTimes(2);
   });
 
-  it("forceRetryFailed re-attempts a known-bad source within TTL", async () => {
+  it("re-parses a known-bad file when its marker predates the fingerprint field", async () => {
     const fs = memFs();
     const failing = converters({
-      fetchRemote: jest.fn(async () => {
-        throw new Error("boom");
+      parseFile: jest.fn(async () => {
+        throw new Error("bad parse");
       }),
     });
-    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 + 1, ttlMs: TTL, forceRetryFailed: true }); // prettier-ignore
+    const file = fileSource({ mtime: 1000, size: 50 });
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [file], nowMs: T0 }); // prettier-ignore
+    // Simulate a legacy marker written before Option D: strip the fingerprint.
+    const markerKey = [...fs.files.keys()].find((k) => k.includes("failed-file-"))!;
+    const legacy = JSON.parse(fs.files.get(markerKey)!) as Record<string, unknown>;
+    delete legacy.fingerprint;
+    fs.files.set(markerKey, JSON.stringify(legacy));
 
-    expect(failing.fetchRemote).toHaveBeenCalledTimes(2); // forced despite fresh marker
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [file], nowMs: T0 + 1 }); // prettier-ignore
+    // A marker with no fingerprint is untrustworthy → re-attempt once, not skip.
+    expect(failing.parseFile).toHaveBeenCalledTimes(2);
   });
 
-  it("clears the negative marker once a previously-failed source succeeds", async () => {
+  it("does not honor a failure marker while a stale snapshot still exists (existing !== null wins)", async () => {
+    // A successful parse leaves a snapshot. A later edit + failed re-parse keeps
+    // that stale snapshot AND writes no marker, so the source stays present and
+    // is re-attempted whenever its fingerprint changes — the marker cheap-skip
+    // path is gated on `existing === null` and never reached here.
+    const fs = memFs();
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: converters(), remotes: [], files: [fileSource({ mtime: 1000, size: 50 })], nowMs: T0 }); // prettier-ignore
+    const failing = converters({
+      parseFile: jest.fn(async () => {
+        throw new Error("bad parse");
+      }),
+    });
+    const { entries, failures } = await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [], files: [fileSource({ mtime: 2000, size: 99 })], nowMs: T0 + 1 }); // prettier-ignore
+
+    expect(failing.parseFile).toHaveBeenCalledTimes(1); // re-attempted, not marker-skipped
+    expect(entries).toHaveLength(1); // stale snapshot still present
+    expect(failures[0]).toMatchObject({ usedStaleSnapshot: true });
+    expect([...fs.files.keys()].some((k) => k.includes("failed-"))).toBe(false);
+  });
+
+  it("keeps a newly-written failure marker wanted so a same-run reconcile can't delete it", async () => {
+    // Production reconciles every run; the marker must be in `wantedFileNames`
+    // the run it's written, or reconcile would delete it before the status panel
+    // can read it.
+    const fs = memFs();
+    const failing = converters({
+      fetchRemote: jest.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
+    const { wantedFileNames } = await materializeSources({
+      cacheDir: CACHE_DIR,
+      fs,
+      converters: failing,
+      remotes,
+      files: [],
+      nowMs: T0,
+    });
+    const markerKey = [...fs.files.keys()].find((k) => k.includes("failed-web-"))!;
+    expect(markerKey).toBeDefined();
+    expect(wantedFileNames.has(markerKey.slice(`${CACHE_DIR}/`.length))).toBe(true);
+    await reconcileCache(fs, CACHE_DIR, wantedFileNames);
+    expect(fs.files.has(markerKey)).toBe(true); // survived the reconcile
+  });
+
+  it("clears the failure marker once a previously-failed source succeeds", async () => {
     const fs = memFs();
     const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
     const failing = converters({
@@ -323,10 +346,11 @@ describe("materializeSources", () => {
         throw new Error("boom");
       }),
     });
-    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0, ttlMs: TTL }); // prettier-ignore
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes, files: [], nowMs: T0 }); // prettier-ignore
     expect([...fs.files.keys()].some((k) => k.includes("failed-web-"))).toBe(true);
 
-    // A forced retry that now succeeds must remove the marker and write the entry.
+    // A forced retry re-attempts the known-bad remote (the automatic path would
+    // cheap-skip it); now it succeeds, removing the marker and writing the entry.
     const { entries, failures } = await materializeSources({
       cacheDir: CACHE_DIR,
       fs,
@@ -334,34 +358,11 @@ describe("materializeSources", () => {
       remotes,
       files: [],
       nowMs: T0 + 1,
-      ttlMs: TTL,
       forceRetryFailed: true,
     });
     expect(entries).toHaveLength(1);
     expect(failures).toHaveLength(0);
     expect([...fs.files.keys()].some((k) => k.includes("failed-web-"))).toBe(false);
-  });
-
-  it("skips a brand-new source whose fetch fails (no file written)", async () => {
-    const fs = memFs();
-    const failing = converters({
-      fetchRemote: jest.fn(async () => {
-        throw new Error("boom");
-      }),
-    });
-    const { entries } = await materializeSources({
-      cacheDir: CACHE_DIR,
-      fs,
-      converters: failing,
-      remotes: [{ type: "web", url: "https://a.com" }],
-      files: [],
-      nowMs: T0,
-      ttlMs: TTL,
-    });
-
-    expect(entries).toHaveLength(0);
-    // The only file is the negative marker (no `.md` snapshot).
-    expect([...fs.files.keys()].every((k) => k.includes("failed-web-"))).toBe(true);
   });
 
   it("deduplicates repeated sources to a single cache file", async () => {
@@ -377,7 +378,6 @@ describe("materializeSources", () => {
       ],
       files: [],
       nowMs: T0,
-      ttlMs: TTL,
     });
     expect(conv.fetchRemote).toHaveBeenCalledTimes(1);
     expect([...fs.files.keys()]).toHaveLength(1);
@@ -397,7 +397,6 @@ describe("materializeSources", () => {
       ],
       files: [fileSource()],
       nowMs: T0,
-      ttlMs: TTL,
       onProgress: (p) => progress.push(p),
     });
 
@@ -414,6 +413,112 @@ describe("materializeSources", () => {
     ]);
   });
 
+  it("emits itemStart/itemSettled only for sources that do work (cheap-skips stay silent)", async () => {
+    const fs = memFs();
+    const conv = converters();
+    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
+    const first: MaterializeProgress[] = [];
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0, onProgress: (p) => first.push(p) }); // prettier-ignore
+    expect(first.filter((p) => p.phase === "itemStart")).toEqual([
+      { phase: "itemStart", item: { kind: "web", source: "https://a.com" } },
+    ]);
+    expect(first.some((p) => p.phase === "itemSettled")).toBe(true);
+
+    // Second pass: the fresh snapshot cheap-skips, so no lifecycle events fire.
+    const second: MaterializeProgress[] = [];
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0 + 1, onProgress: (p) => second.push(p) }); // prettier-ignore
+    expect(second.some((p) => p.phase.startsWith("item"))).toBe(false);
+  });
+
+  it("emits itemFailed (carrying the error) for a failed source, never itemSettled", async () => {
+    const fs = memFs();
+    const failing = converters({
+      fetchRemote: jest.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+    const events: MaterializeProgress[] = [];
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: failing, remotes: [{ type: "web", url: "https://a.com" }], files: [], nowMs: T0, onProgress: (p) => events.push(p) }); // prettier-ignore
+    expect(events.filter((p) => p.phase.startsWith("item")).map((p) => p.phase)).toEqual([
+      "itemStart",
+      "itemFailed",
+    ]);
+    const failed = events.find((p) => p.phase === "itemFailed");
+    expect(failed?.phase).toBe("itemFailed");
+    if (failed?.phase === "itemFailed") {
+      expect(failed.item).toEqual({ kind: "web", source: "https://a.com" });
+      expect(failed.failure.error).toContain("boom");
+    }
+  });
+
+  it("fetches URLs in parallel — both are in flight before either settles", async () => {
+    const fs = memFs();
+    const gates: Record<string, () => void> = {};
+    const inFlight: string[] = [];
+    const conv = converters({
+      fetchRemote: jest.fn(async (s: RemoteSource) => {
+        inFlight.push(s.url);
+        await new Promise<void>((resolve) => {
+          gates[s.url] = resolve;
+        });
+        return `content ${s.url}`;
+      }),
+    });
+    const done = materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [{ type: "web", url: "https://a.com" }, { type: "web", url: "https://b.com" }], files: [], nowMs: T0 }); // prettier-ignore
+    // Flush microtasks so both tasks reach their (gated) fetch await.
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(new Set(inFlight)).toEqual(new Set(["https://a.com", "https://b.com"]));
+    gates["https://a.com"]();
+    gates["https://b.com"]();
+    await done;
+  });
+
+  it("isolates a marker-write failure to its own source — the parallel run still resolves", async () => {
+    // A's fetch fails AND writing its failure marker also throws (full/locked
+    // disk) while B is still in flight. Pre-fix this rejected the remotes'
+    // `Promise.all` mid-run, so B's late progress could re-block an
+    // already-settled atom. Now A degrades to a per-source failure
+    // (lifecycle-paired: itemStart → itemFailed, never itemSettled) and the
+    // still-running B finishes untouched, with prefetch reaching 2/2.
+    const fs = memFs();
+    // memFs's writeText closes over `files` (no `this`), so capturing it plainly
+    // and calling it unbound is safe — we just gate the failure-marker path.
+    const writeText = fs.writeText;
+    fs.writeText = async (p: string, content: string) => {
+      if (p.includes("failed-")) throw new Error("disk full");
+      await writeText(p, content);
+    };
+    let releaseB!: () => void;
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const conv = converters({
+      fetchRemote: jest.fn(async (s: RemoteSource) => {
+        if (s.url === "https://a.com") throw new Error("net down");
+        await bGate; // keep B in flight until A has already failed its marker write
+        return `content ${s.url}`;
+      }),
+    });
+    const events: MaterializeProgress[] = [];
+    const done = materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes: [{ type: "web", url: "https://a.com" }, { type: "web", url: "https://b.com" }], files: [], nowMs: T0, onProgress: (p) => events.push(p) }); // prettier-ignore
+    // Flush microtasks so A runs through its (throwing) marker write while B waits.
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    releaseB();
+    const result = await done;
+
+    // The run resolved (no rejection): A is a per-source failure, B an entry.
+    expect(result.failures.map((f) => f.source)).toEqual(["https://a.com"]);
+    expect(result.entries.map((e) => e.source)).toEqual(["https://b.com"]);
+
+    const itemPhasesFor = (url: string) =>
+      events.filter((p) => "item" in p && p.item.source === url).map((p) => p.phase);
+    expect(itemPhasesFor("https://a.com")).toEqual(["itemStart", "itemFailed"]);
+    expect(itemPhasesFor("https://b.com")).toEqual(["itemStart", "itemSettled"]);
+    // Both remote tasks completed their prefetch accounting despite A's throw.
+    const prefetch = events.filter((p) => p.phase === "prefetch");
+    expect(prefetch[prefetch.length - 1]).toEqual({ phase: "prefetch", done: 2, total: 2 });
+  });
+
   it("omits onProgress for an empty loop", async () => {
     const fs = memFs();
     const progress: MaterializeProgress[] = [];
@@ -424,7 +529,6 @@ describe("materializeSources", () => {
       remotes: [{ type: "web", url: "https://a.com" }],
       files: [],
       nowMs: T0,
-      ttlMs: TTL,
       onProgress: (p) => progress.push(p),
     });
     expect(progress.some((p) => p.phase === "parse")).toBe(false);

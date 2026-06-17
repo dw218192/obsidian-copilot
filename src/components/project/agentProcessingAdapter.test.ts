@@ -109,17 +109,129 @@ describe("buildAgentProcessingItems", () => {
     expect(file.status).toBe("failed");
   });
 
-  it("shows saved sources as Converting while a run is in flight, but never unsaved drafts", () => {
-    const live = entry({ phase: "prefetch", prefetch: { done: 0, total: 2 } });
+  it("shows in-flight sources (processingSources) as Converting and queues the rest", () => {
+    // Mid-run: the URL is actively fetching (in processingSources) → processing;
+    // the file hasn't started yet → Queued. Both are saved.
+    const live = entry({
+      phase: "prefetch",
+      prefetch: { done: 0, total: 2 },
+      processingSources: [{ kind: "web", source: URL_A }],
+    });
+    const [web, file] = buildAgentProcessingItems([webSource, fileSource], live, disk(), SAVED_ALL);
+    expect(web.status).toBe("processing");
+    expect(file.status).toBe("pending"); // queued: hasn't started this run
+  });
+
+  it("never shows an unsaved draft as processing, even when a run is in flight", () => {
+    const live = entry({ phase: "prefetch", prefetch: { done: 0, total: 1 } });
     const savedOnlyFile = new Set([`file:${PDF}`]);
-    const [web, file] = buildAgentProcessingItems(
-      [webSource, fileSource],
+    const [web] = buildAgentProcessingItems([webSource], live, disk(), savedOnlyFile);
+    expect(web.status).toBe("pending"); // draft-only URL: no run knows about it
+  });
+
+  it("shows all parallel-fetched URLs as Converting together", () => {
+    // URLs fetch in parallel, so processingSources holds them all at once.
+    const URL_B = "https://b.example.com/x";
+    const live = entry({
+      phase: "prefetch",
+      prefetch: { done: 0, total: 2 },
+      processingSources: [
+        { kind: "web", source: URL_A },
+        { kind: "web", source: URL_B },
+      ],
+    });
+    const items = buildAgentProcessingItems(
+      [webSource, { kind: "web", source: URL_B }],
       live,
       disk(),
-      savedOnlyFile
+      new Set([`web:${URL_A}`, `web:${URL_B}`])
     );
-    expect(web.status).toBe("pending"); // draft-only URL: no run knows about it
-    expect(file.status).toBe("processing");
+    expect(items.map((i) => i.status)).toEqual(["processing", "processing"]);
+  });
+
+  it("shows a saved failure marker as Failed during a run (Option D skips it), Converting only when retried", () => {
+    // Option D cheap-skips a known-bad source on the automatic run, so a valid
+    // marker reads as failed even mid-run — never Queued (nothing re-fetches it
+    // until a manual Retry). It flips to Converting only when the user forces a
+    // retry and the source enters processingSources.
+    const d = disk({
+      markersByName: new Map([
+        [
+          failureMarkerName("web", URL_A),
+          { source: URL_A, kind: "web" as const, error: "fetch 404", failedAt: 1 },
+        ],
+      ]),
+    });
+    const duringRun = entry({ phase: "prefetch", prefetch: { done: 0, total: 1 } });
+    const [failed] = buildAgentProcessingItems([webSource], duringRun, d, SAVED_ALL);
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toBe("fetch 404");
+
+    const active = entry({
+      phase: "prefetch",
+      prefetch: { done: 0, total: 1 },
+      processingSources: [{ kind: "web", source: URL_A }],
+    });
+    const [web] = buildAgentProcessingItems([webSource], active, d, SAVED_ALL);
+    expect(web.status).toBe("processing");
+    expect(web.error).toBeUndefined();
+
+    // The per-row "Retry" path drives `retryingSources` (not processingSources);
+    // it too must override the marker so the row spins immediately on click.
+    const retrying = entry({ phase: "done", retryingSources: [{ kind: "web", source: URL_A }] });
+    expect(buildAgentProcessingItems([webSource], retrying, d, SAVED_ALL)[0].status).toBe("processing"); // prettier-ignore
+  });
+
+  it("honors a file failure marker only while its fingerprint matches (changed/legacy → re-attempt)", () => {
+    const markerName = failureMarkerName("file", PDF);
+    const withMarker = (fingerprint?: string) =>
+      disk({
+        markersByName: new Map([
+          [
+            markerName,
+            {
+              source: PDF,
+              kind: "file" as const,
+              error: "parse boom",
+              failedAt: 1,
+              ...(fingerprint !== undefined ? { fingerprint } : {}),
+            },
+          ],
+        ]),
+      });
+    const duringRun = entry({ phase: "parse", parsed: { done: 0, total: 1 } });
+
+    // fileSource's live fingerprint is "100:5".
+    // Marker fingerprint matches → cheap-skipped → failed, even mid-run.
+    const matched = buildAgentProcessingItems([fileSource], duringRun, withMarker("100:5"), SAVED_ALL)[0]; // prettier-ignore
+    expect(matched.status).toBe("failed");
+    expect(matched.error).toBe("parse boom");
+
+    // File changed since the failure (fingerprint mismatch) → marker not honored,
+    // the run re-attempts it → Queued, not a stale failure.
+    expect(buildAgentProcessingItems([fileSource], duringRun, withMarker("999:9"), SAVED_ALL)[0].status).toBe("pending"); // prettier-ignore
+
+    // Legacy marker without a fingerprint → untrustworthy → re-attempted, not failed.
+    expect(buildAgentProcessingItems([fileSource], duringRun, withMarker(undefined), SAVED_ALL)[0].status).toBe("pending"); // prettier-ignore
+  });
+
+  it("shows a stale file snapshot as Converting only while it's in processingSources", () => {
+    const name = cacheFileName("file", PDF);
+    const d = disk({
+      snapshotNames: new Set([name]),
+      fingerprintsByName: new Map([[name, "100:5"]]),
+    });
+    const changed = { ...fileSource, fingerprint: "200:9" };
+    // Run active, file not yet re-parsed → Queued.
+    const queued = entry({ phase: "parse", parsed: { done: 0, total: 1 } });
+    expect(buildAgentProcessingItems([changed], queued, d, SAVED_ALL)[0].status).toBe("pending");
+    // Being re-parsed → processing.
+    const active = entry({
+      phase: "parse",
+      parsed: { done: 0, total: 1 },
+      processingSources: [{ kind: "file", source: PDF }],
+    });
+    expect(buildAgentProcessingItems([changed], active, d, SAVED_ALL)[0].status).toBe("processing");
   });
 
   it("distinguishes a same-URL web and youtube pair by cacheKind (matches the CAG id contract)", () => {

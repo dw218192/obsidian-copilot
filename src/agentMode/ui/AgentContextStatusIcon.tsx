@@ -7,6 +7,7 @@ import {
 } from "@/aiParams";
 import { AgentContextConversionModalContent } from "@/components/project/AgentContextConversionModalContent";
 import type { ProcessingItem } from "@/components/project/processingAdapter";
+import { useAgentPersistentFailureCount } from "@/components/project/useAgentPersistentFailureCount";
 import { useAgentProcessingItems } from "@/components/project/useAgentProcessingItems";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -40,8 +41,9 @@ interface AgentContextStatusIconProps {
    * if the chosen side lacks room.
    */
   landing: boolean;
-  /** Whole-run re-materialize (popover "Retry all/failed"); bypasses the failure
-   * cache. Returns whether a run actually started (false for no-op scopes). */
+  /** Whole-run re-materialize (popover "Retry all/failed"): re-attempts failed
+   * sources (already-successful snapshots cheap-skip by fingerprint). Returns
+   * whether a run actually started (false for no-op scopes). */
   onReindex: () => boolean;
   /** Per-source retry (popover row "Retry") → `AgentSessionManager.rematerializeSource`.
    * Resolves to whether the retry actually ran (false when deduped/skipped). */
@@ -120,15 +122,41 @@ function stepStatus(
  */
 export function buildStatusView(
   entry: AgentProjectContextLoadState | undefined,
-  hasConfiguredContextSource: boolean
+  hasConfiguredContextSource: boolean,
+  persistentMissingCount = 0
 ): StatusView {
+  // Failures persist as on-disk markers (Option D), so a settled project can have
+  // failed sources the live atom no longer carries. `persistentMissingCount` (a
+  // disk read by the always-mounted icon — see useAgentPersistentFailureCount)
+  // surfaces them as failed even when no run is driving the atom. Only a NON-zero
+  // count matters; it never overrides an in-flight `working`.
+  const persistent = Math.max(0, persistentMissingCount);
+
   if (!entry || entry.phase === "idle") {
+    // `persistent` is fed only here-via-`!entry`: a project that never ran a
+    // materialization this session (e.g. a reused landing) has NO atom entry, yet
+    // its prior failures live on disk. The `phase === "idle"` arm never receives a
+    // non-zero `persistent` because the hook gates its disk read to settled-done /
+    // no-entry (no producer writes a per-project `phase: "idle"` entry today); it
+    // shares this arm only to fall through to the same neutral idle glyph. If a
+    // future review flags the idle/persistent pairing as unreachable, point them
+    // at this note — it's intentional, the live path is the `!entry` one.
+    if (persistent > 0) {
+      return { kind: "failed", headline: failedHeadline(persistent), steps: [], failures: [] };
+    }
     return { kind: "idle", headline: "No context loaded", steps: [], failures: [] };
   }
 
   const failures = entry.failedSources ?? [];
   const missing = failures.filter((f) => !f.usedStaleSnapshot);
   const done = entry.phase === "done";
+  // A per-source / per-row retry runs while the phase stays `done` (it only sets
+  // `retryingSources`), and a full run carries `processingSources` mid-flight.
+  // Either means work is in flight, so the glyph must read "working" — not the
+  // green "ready" the bare phase check would give after an optimistic retry
+  // clears the failure.
+  const inFlight =
+    (entry.retryingSources?.length ?? 0) > 0 || (entry.processingSources?.length ?? 0) > 0;
 
   // Build the real-count step rows — never fabricated, so a row appears only for
   // work that actually has a count (resolved files, prefetched URLs, parsed files).
@@ -154,18 +182,22 @@ export function buildStatusView(
     });
   }
 
-  if (!done) {
+  if (!done || inFlight) {
     const totalCount = (entry.prefetch?.total ?? 0) + (entry.parsed?.total ?? 0);
     const doneCount = (entry.prefetch?.done ?? 0) + (entry.parsed?.done ?? 0);
     const headline =
-      totalCount > 0 ? `Indexing context · ${doneCount}/${totalCount}` : "Indexing context";
+      !done && totalCount > 0
+        ? `Indexing context · ${doneCount}/${totalCount}`
+        : "Indexing context";
     return { kind: "working", headline, steps, failures };
   }
 
   // Completed.
-  if (missing.length > 0) {
-    const headline = missing.length === 1 ? "1 source failed" : `${missing.length} sources failed`;
-    return { kind: "failed", headline, steps, failures };
+  // Live missing failures take precedence; otherwise fall back to the persisted
+  // on-disk markers (the settled-state truth the popover already shows).
+  const missingCount = missing.length > 0 ? missing.length : persistent;
+  if (missingCount > 0) {
+    return { kind: "failed", headline: failedHeadline(missingCount), steps, failures };
   }
   // Clean (or stale-only) completion. Rest on the neutral `idle` icon when the
   // project has no configured context source — there is nothing to call "ready".
@@ -173,6 +205,11 @@ export function buildStatusView(
     return { kind: "idle", headline: "No context loaded", steps: [], failures: [] };
   }
   return { kind: "ready", headline: "Context ready", steps, failures };
+}
+
+/** "N source(s) failed" headline for the failed glyph. */
+function failedHeadline(count: number): string {
+  return count === 1 ? "1 source failed" : `${count} sources failed`;
 }
 
 interface ResolvedStatus {
@@ -197,19 +234,37 @@ interface ResolvedStatus {
  * always carries the real status for the popover.
  */
 function useStatusView(
+  app: App,
   activeProjectId: ProjectScopeId,
+  project: ProjectConfig,
   hasConfiguredContextSource: boolean
 ): ResolvedStatus {
   const states = useAtomValue(agentProjectContextLoadAtom, { store: settingsStore });
   const entry = activeProjectId === GLOBAL_SCOPE ? undefined : states[activeProjectId];
-  const view = buildStatusView(entry, hasConfiguredContextSource);
+  // Persisted on-disk failures the live atom may not carry once a run has settled
+  // (Option D). Only consulted for the active project; gated to settled states
+  // inside the hook so a live run pays no extra disk I/O.
+  const persistentMissingCount = useAgentPersistentFailureCount(
+    app,
+    project,
+    entry,
+    activeProjectId !== GLOBAL_SCOPE && project.id === activeProjectId
+  );
+  const view = buildStatusView(entry, hasConfiguredContextSource, persistentMissingCount);
 
-  // Anti-flash gate, keyed on project + phase so a fresh working phase restarts
-  // the delay and a project switch resets it. The reset is done during render
-  // (React's "adjust state from props" pattern) so only the timer's async reveal
-  // touches state from the effect — keeping the effect side-effect-only.
+  // Anti-flash gate, keyed on project + phase + a retry-episode flag so a fresh
+  // working phase restarts the delay and a project switch resets it. The flag
+  // captures ONLY a retry that runs while the phase stays `done` (the one working
+  // episode the phase can't mark); a live run's per-item `processingSources`
+  // churn must NOT enter the key, or the spinner would re-mask to idle at every
+  // source boundary. The reset is done during render (React's "adjust state from
+  // props" pattern) so only the timer's async reveal touches state from the
+  // effect — keeping the effect side-effect-only.
   const [revealWorking, setRevealWorking] = useState(false);
-  const delayKey = `${activeProjectId}\0${entry?.phase ?? "none"}`;
+  const retryWhileDone =
+    entry?.phase === "done" &&
+    ((entry.retryingSources?.length ?? 0) > 0 || (entry.processingSources?.length ?? 0) > 0);
+  const delayKey = `${activeProjectId}\0${entry?.phase ?? "none"}\0${retryWhileDone ? "retry" : ""}`;
   const prevKeyRef = useRef(delayKey);
   if (prevKeyRef.current !== delayKey) {
     prevKeyRef.current = delayKey;
@@ -222,7 +277,12 @@ function useStatusView(
     return () => window.clearTimeout(timer);
   }, [view.kind, delayKey]);
 
-  const masked = view.kind === "working" && !revealWorking;
+  // Anti-flash masks a `working` glyph as `idle` for the first WORKING_REVEAL_MS
+  // so a warm AUTO run that settles fast never flashes the spinner. A
+  // user-initiated retry (the `retryWhileDone` working episode) is exempt: the
+  // user just clicked, so show the spinner immediately rather than blink the
+  // neutral "no context" glyph first.
+  const masked = view.kind === "working" && !revealWorking && !retryWhileDone;
   return { view, triggerKind: masked ? "idle" : view.kind };
 }
 
@@ -256,7 +316,7 @@ export default function AgentContextStatusIcon({
   onRefreshLanding,
   onEditContext,
 }: AgentContextStatusIconProps) {
-  const { triggerKind } = useStatusView(activeProjectId, hasConfiguredContextSource);
+  const { triggerKind } = useStatusView(app, activeProjectId, project, hasConfiguredContextSource);
   const [open, setOpen] = useState(false);
 
   // A retry/reindex re-captures context by swapping the empty landing session,

@@ -11,9 +11,16 @@ import { AgentSessionManager } from "./AgentSessionManager";
 import { GLOBAL_SCOPE } from "./scope";
 import { setSettings as mockedSetSettings } from "@/settings/model";
 import * as projectsState from "@/projects/state";
-import { ensureProjectContextMaterialized } from "@/context/projectContextMaterializer";
+import {
+  ensureProjectContextMaterialized,
+  type ContextMaterializeProgress,
+} from "@/context/projectContextMaterializer";
 import { ProjectFileManager } from "@/projects/ProjectFileManager";
-import type { ProjectConfig } from "@/aiParams";
+import {
+  agentProjectContextLoadAtom,
+  type AgentProjectContextLoadState,
+  type ProjectConfig,
+} from "@/aiParams";
 import type { ProjectFileRecord } from "@/projects/type";
 import { getProjectContextSignature } from "@/projects/projectContextSignature";
 import type { BackendDescriptor } from "./types";
@@ -55,6 +62,9 @@ jest.mock("@/context/projectContextMaterializer", () => {
         contextSignature: record ? getProjectContextSignature(record) : undefined,
       };
     }),
+    // The forced-retry entries drain any in-flight run before starting; with no
+    // real single-flight map in tests this resolves immediately.
+    awaitInFlightMaterialization: jest.fn(() => Promise.resolve()),
     EMPTY_CONTEXT_MATERIALIZATION_RESULT: { additionalDirectories: [] },
   };
 });
@@ -2277,6 +2287,41 @@ describe("AgentSessionManager context-source dirty tracking", () => {
     expect(mgr.getActiveSession()).toBe(landing);
   });
 
+  it("rematerializeContext forces a retry of known-bad sources", async () => {
+    publish(makeRecord({ webUrls: "https://a.com" }));
+    const mgr = buildTrackedManager();
+    await mgr.enterProject(PID);
+    await flushAsync();
+    mockEnsureMaterialized.mockClear();
+
+    const started = mgr.rematerializeContext(PID);
+    await flushAsync();
+
+    expect(started).toBe(true);
+    expect(mockEnsureMaterialized).toHaveBeenCalledTimes(1);
+    // The 5th arg (forceRetryFailed) is forwarded as true so the materializer
+    // re-fetches sources whose failure markers the automatic path would honor.
+    expect(mockEnsureMaterialized.mock.calls[0][4]).toBe(true);
+  });
+
+  it("rematerializeContext early-exits while a run already owns the load atom", async () => {
+    publish(makeRecord({ webUrls: "https://a.com" }));
+    const mgr = buildTrackedManager();
+    await mgr.enterProject(PID);
+    await flushAsync();
+    mockEnsureMaterialized.mockClear();
+
+    // A full run is blocking the atom: the forced retry would otherwise join it
+    // and have its force swallowed, so it must early-exit instead.
+    const getMock = jest.requireMock("@/settings/model").settingsStore.get as jest.Mock;
+    getMock.mockReturnValueOnce({ [PID]: { phase: "prefetch", blocking: true } });
+
+    const started = mgr.rematerializeContext(PID);
+
+    expect(started).toBe(false);
+    expect(mockEnsureMaterialized).not.toHaveBeenCalled();
+  });
+
   it("warms the active project's cache on a source edit without gating the composer", async () => {
     publish(makeRecord({ webUrls: "https://a.com" }));
     const mgr = buildTrackedManager();
@@ -2306,5 +2351,73 @@ describe("AgentSessionManager context-source dirty tracking", () => {
     // A post-shutdown edit must not warm or throw.
     expect(() => publish(makeRecord({ webUrls: "https://a.com\nhttps://b.com" }))).not.toThrow();
     expect(mockEnsureMaterialized).not.toHaveBeenCalled();
+  });
+
+  it("publishes processingSources + incremental failedSources during a run, clears at done", async () => {
+    publish(makeRecord({ webUrls: "https://a.com" }));
+    const mgr = buildTrackedManager();
+    const setMock = jest.requireMock("@/settings/model").settingsStore.set as jest.Mock;
+    // Reconstruct the latest published load-state by replaying the most recent
+    // `settingsStore.set(agentProjectContextLoadAtom, updater)` call (the store is
+    // mocked, so there is no live atom to read back).
+    const latest = (): AgentProjectContextLoadState | undefined => {
+      for (let i = setMock.mock.calls.length - 1; i >= 0; i--) {
+        const [atom, updater] = setMock.mock.calls[i];
+        if (atom !== agentProjectContextLoadAtom || typeof updater !== "function") continue;
+        const next = updater({}) as Record<string, AgentProjectContextLoadState>;
+        if (next[PID]) return next[PID];
+      }
+      return undefined;
+    };
+
+    let drive!: (p: ContextMaterializeProgress) => void;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockEnsureMaterialized.mockImplementationOnce(
+      async (
+        _app: unknown,
+        _pid: string,
+        _cwd: string,
+        onProgress: (p: ContextMaterializeProgress) => void
+      ) => {
+        drive = onProgress;
+        onProgress({ phase: "prefetch", done: 0, total: 1 });
+        onProgress({ phase: "itemStart", item: { kind: "web", source: "https://a.com" } });
+        await gate;
+        return { additionalDirectories: [] };
+      }
+    );
+
+    const entering = mgr.enterProject(PID);
+    await flushAsync();
+
+    // Mid-flight: the source being fetched is published in `processingSources`.
+    expect(latest()).toMatchObject({
+      phase: "prefetch",
+      blocking: true,
+      processingSources: [{ kind: "web", source: "https://a.com" }],
+    });
+
+    // Settle as a failure: it leaves `processingSources` and lands in
+    // `failedSources` immediately — not deferred to the end of the run.
+    drive({
+      phase: "itemFailed",
+      item: { kind: "web", source: "https://a.com" },
+      failure: { kind: "web", source: "https://a.com", error: "boom", usedStaleSnapshot: false },
+    });
+    const afterFail = latest()!;
+    expect(afterFail.processingSources).toBeUndefined();
+    expect(afterFail.failedSources).toEqual([
+      { path: "https://a.com", type: "web", error: "boom", usedStaleSnapshot: false },
+    ]);
+
+    release();
+    await entering;
+    await flushAsync(); // let the materialize `.then()` publish the terminal "done"
+    // Done: nothing is processing.
+    expect(latest()).toMatchObject({ phase: "done", blocking: false });
+    expect(latest()!.processingSources).toBeUndefined();
   });
 });

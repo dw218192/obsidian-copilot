@@ -4,20 +4,28 @@
  * failure markers, and the (possibly unsaved) form draft — into the
  * ProcessingItem[] model rendered by the ProcessingStatus panel.
  *
- * Per-item status priority (highest first):
- *  1. live failure from this session's run (missing → failed; stale → ready)
- *  2. disk snapshot present → Converted (for files, only when the stored
- *     `mtime:size` fingerprint still matches — a changed file shows Queued)
- *  3. disk failure marker present → failed, with the persisted error
- *  4. a run is in flight and the source is saved → processing
- *  5. otherwise → pending (Queued: the next materialization handles it)
+ * Per-item status priority (highest first), mirroring the legacy CAG tracker's
+ * `processing > failed > success > queued` set membership (with the agent's disk
+ * snapshots/markers as the persistent success/failure truth between runs):
+ *  1. source being (re-)fetched right now — per-row Retry OR the full run's live
+ *     `processingSources` set → processing
+ *  2. live failure settled THIS run (missing → failed; stale → ready)
+ *  3. fresh disk snapshot present → Converted (for files, only when the stored
+ *     `mtime:size` fingerprint still matches — a changed file falls through)
+ *  4. valid disk failure marker → failed. Under Option D the next automatic run
+ *     cheap-skips a known-bad source (no re-fetch until a manual Retry), so it
+ *     reads as failed even mid-run, never "Queued". A file marker is honored only
+ *     while its fingerprint still matches the live file (a changed file falls
+ *     through to be re-attempted).
+ *  5. a run is in flight and the source has no valid marker and hasn't
+ *     started/settled yet → Queued (pending) — a genuinely new/changed source.
+ *  6. otherwise → pending (Queued: the next materialization handles it)
  *
- * The live atom carries per-source data ONLY for failures (plus coarse phase),
- * so ready/queued always comes from disk — never inferred from the atom.
+ * The live atom drives processing/failed; ready/queued otherwise come from disk.
  */
 
 import type { AgentProjectContextLoadState, FailedItem } from "@/aiParams";
-import { EMPTY_RETRYING_SOURCES } from "@/aiParams";
+import { EMPTY_PROCESSING_SOURCES, EMPTY_RETRYING_SOURCES } from "@/aiParams";
 import {
   processingItemEnvelope,
   type ProcessingItem,
@@ -133,6 +141,7 @@ export function buildAgentProcessingItems(
   const running = liveEntry !== undefined && IN_FLIGHT_PHASES.has(liveEntry.phase);
   const liveFailures = liveEntry?.failedSources ?? [];
   const retrying = liveEntry?.retryingSources ?? EMPTY_RETRYING_SOURCES;
+  const processing = liveEntry?.processingSources ?? EMPTY_PROCESSING_SOURCES;
 
   return sources.map(({ kind, source, fingerprint }) => {
     const key = `${kind}:${source}`;
@@ -144,10 +153,28 @@ export function buildAgentProcessingItems(
     const hasSnapshot = disk?.snapshotNames.has(snapshotName) ?? false;
     const marker = disk?.markersByName.get(failureMarkerName(kind, source));
     const isRetrying = retrying.some((r) => r.kind === kind && r.source === source);
+    const isProcessing = processing.some((p) => p.kind === kind && p.source === source);
+    // A file snapshot is only trustworthy when its stored `mtime:size` still
+    // matches the live file; a missing/unparseable fingerprint can't prove the
+    // snapshot is current, so a changed file falls through to Queued/processing.
+    // URL snapshots are identity-fingerprinted (the name alone proves freshness).
+    const stored = disk?.fingerprintsByName.get(snapshotName);
+    const freshSnapshot =
+      hasSnapshot && (kind !== "file" || (stored !== undefined && stored === fingerprint));
+    // A persisted failure the next automatic run will honor (Option D cheap-skips
+    // a known-bad source until the user retries). Mirrors the materializer's skip
+    // condition: a remote marker is identity-keyed; a file marker is trustworthy
+    // only while its stored `mtime:size` still matches the live file — a changed
+    // file (or a legacy marker with no fingerprint) is NOT valid, so it falls
+    // through to be re-attempted rather than showing a stale failure.
+    const validMarker =
+      marker !== undefined && (kind !== "file" || marker.fingerprint === fingerprint)
+        ? marker
+        : undefined;
 
-    if (isRetrying && savedKeys.has(key)) {
-      // Optimistic: this source's per-source retry is in flight — show the
-      // spinner immediately so the click has feedback even if it fails again.
+    if ((isRetrying || isProcessing) && savedKeys.has(key)) {
+      // This source is being (re-)fetched right now — the per-row Retry, or the
+      // full run's live processing set. Show the spinner.
       status = "processing";
     } else if (live && !live.usedStaleSnapshot) {
       status = "failed";
@@ -155,20 +182,31 @@ export function buildAgentProcessingItems(
     } else if (live?.usedStaleSnapshot) {
       // A stale-but-usable live failure counts as converted (context is present).
       status = "ready";
-    } else if (hasSnapshot) {
-      // A file snapshot is only trustworthy when its stored `mtime:size` still
-      // matches the live file; a missing/unparseable fingerprint can't prove the
-      // snapshot is current, so fall back to Queued rather than assert Converted.
-      // URL snapshots are identity-fingerprinted (the name proves freshness).
-      const stored = disk?.fingerprintsByName.get(snapshotName);
-      const fileSnapshotCurrent =
-        kind !== "file" || (stored !== undefined && stored === fingerprint);
-      status = fileSnapshotCurrent ? "ready" : "pending";
-    } else if (marker) {
+    } else if (freshSnapshot) {
+      status = "ready";
+    } else if (validMarker) {
+      // A known-bad source the next run will cheap-skip (Option D), so it reads as
+      // failed even mid-run — NOT "Queued", which would wrongly imply it's about
+      // to be processed when nothing will re-fetch it until a manual Retry.
       status = "failed";
-      error = marker.error;
+      error = validMarker.error;
     } else if (running && savedKeys.has(key)) {
-      status = "processing";
+      // A run is active and this source has no valid failure marker and hasn't
+      // started/settled yet → Queued (a genuinely new/changed source the run will
+      // attempt).
+      //
+      // DESIGN NOTE — success is disk-truth, NOT a live atom set. When a source
+      // emits `itemSettled` it leaves `processingSources`, but its fresh snapshot
+      // isn't observed until `useAgentProcessingItems` re-reads the cache dir (it
+      // re-reads on every `liveEntry` change). So a just-settled source can read
+      // as Queued here for one async cache-dir read (~tens of ms) before flipping
+      // to Ready — a transient, self-correcting popover flicker. We deliberately
+      // do NOT keep a 4th live `succeededSources` set to erase it: that would
+      // duplicate the whole processingSources machinery (atom field + publish +
+      // clear + tests) to smooth a cosmetic blip that never touches the cache,
+      // the send gate, or captured session context. If a future review flags
+      // this again, point them at this note.
+      status = "pending";
     }
 
     return {

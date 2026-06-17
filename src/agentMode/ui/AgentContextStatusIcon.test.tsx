@@ -61,6 +61,56 @@ describe("buildStatusView", () => {
     expect(v.headline).toBe("Indexing context · 2/4");
   });
 
+  it("is working when a retry is in flight even though the phase is still done", () => {
+    // A per-row retry sets `retryingSources` but leaves phase at "done" (and
+    // optimistically clears the failure) — the glyph must read working, not the
+    // green "ready" the bare phase check would give.
+    const v = buildStatusView(
+      entry({ phase: "done", retryingSources: [{ kind: "web", source: "https://a.com" }] }),
+      true
+    );
+    expect(v.kind).toBe("working");
+  });
+
+  it("is working when a source is processing even though the phase is still done", () => {
+    const v = buildStatusView(
+      entry({ phase: "done", processingSources: [{ kind: "web", source: "https://a.com" }] }),
+      true
+    );
+    expect(v.kind).toBe("working");
+  });
+
+  it("is failed from a persistent on-disk marker count when no entry exists yet", () => {
+    // A project whose failures live only as disk markers (Option D), with no run
+    // this session — the icon must read failed, not idle/ready.
+    const v = buildStatusView(undefined, true, 1);
+    expect(v.kind).toBe("failed");
+    expect(v.headline).toBe("1 source failed");
+  });
+
+  it("is failed from the persistent count on a clean-looking settled entry", () => {
+    const v = buildStatusView(entry({ phase: "done" }), true, 2);
+    expect(v.kind).toBe("failed");
+    expect(v.headline).toBe("2 sources failed");
+  });
+
+  it("prefers live missing failures over the persistent count", () => {
+    // A live missing failure is this run's truth; the disk count must not inflate
+    // the headline.
+    const v = buildStatusView(entry({ phase: "done", failedSources: [webFailure] }), true, 5);
+    expect(v.kind).toBe("failed");
+    expect(v.headline).toBe("1 source failed");
+  });
+
+  it("stays working over a persistent count while a retry is in flight", () => {
+    const v = buildStatusView(
+      entry({ phase: "done", retryingSources: [{ kind: "web", source: "https://a.com" }] }),
+      true,
+      3
+    );
+    expect(v.kind).toBe("working");
+  });
+
   it("is failed when a source is missing (no stale fallback)", () => {
     const v = buildStatusView(entry({ phase: "done", failedSources: [webFailure] }), true);
     expect(v.kind).toBe("failed");
@@ -184,6 +234,19 @@ describe("AgentContextStatusIcon anti-flash", () => {
     act(() => {
       jest.advanceTimersByTime(350);
     });
+    expect(spinner(container)).not.toBeNull();
+  });
+
+  it("shows the working spinner immediately for a user retry (no anti-flash idle blink)", () => {
+    // A per-row retry keeps phase `done` and sets `retryingSources`; the user just
+    // clicked, so the spinner must show at once — never blink the neutral idle
+    // glyph first.
+    setEntry({
+      phase: "done",
+      blocking: false,
+      retryingSources: [{ kind: "web", source: "https://a.com" }],
+    });
+    const { container } = renderIcon();
     expect(spinner(container)).not.toBeNull();
   });
 });

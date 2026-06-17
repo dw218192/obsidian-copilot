@@ -14,6 +14,7 @@ import {
   type ContextConverters,
   type FileSource,
   type MaterializedSourceType,
+  type MaterializeSourceIdentity,
   type RemoteSource,
   type SourceFailure,
 } from "./contextCacheStore";
@@ -58,12 +59,12 @@ export type ContextMaterializeProgress =
   | { phase: "resolve"; resolved: number }
   | { phase: "prefetch"; done: number; total: number }
   | { phase: "parse"; done: number; total: number }
+  | { phase: "itemStart"; item: MaterializeSourceIdentity }
+  | { phase: "itemFailed"; item: MaterializeSourceIdentity; failure: SourceFailure }
+  | { phase: "itemSettled"; item: MaterializeSourceIdentity }
   | { phase: "failures"; failures: SourceFailure[] };
 
 export type ContextMaterializeProgressFn = (progress: ContextMaterializeProgress) => void;
-
-/** Re-fetch a URL/YouTube source at most once per day (cheap-skip otherwise). */
-const REMOTE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // Referential stability: a single frozen empty array for every "no context" exit.
 const EMPTY_DIRECTORIES: string[] = Object.freeze([] as string[]) as string[];
@@ -98,8 +99,57 @@ const EMPTY_RESULT = EMPTY_CONTEXT_MATERIALIZATION_RESULT;
  * the new cwd, and keying by cwd would weaken the single-flight (the whole point
  * is to dedupe per project). Not worth the extra key. If a future review flags
  * this again, point them at this note.
+ *
+ * The entry carries whether its run is a FORCED retry so the single-flight can
+ * tell a background warm apart from a user "Retry": a forced call supersedes an
+ * in-flight non-force run (see {@link ensureProjectContextMaterialized}).
  */
-const inFlightMaterializations = new Map<string, Promise<ContextMaterializationResult>>();
+interface InFlightMaterialization {
+  promise: Promise<ContextMaterializationResult>;
+  /** True when this run bypasses failure markers (a user-initiated retry). */
+  forceRetryFailed: boolean;
+}
+
+const inFlightMaterializations = new Map<string, InFlightMaterialization>();
+
+/**
+ * Per-project set of in-flight SINGLE-source retries (the Content Conversion
+ * panel's per-row "Retry"). A single-source retry writes one snapshot WITHOUT a
+ * reconcile pass; a full run that starts mid-write must wait for it before its
+ * own `materializeSources` reads the dir, or it would cheap-skip the still-
+ * failing source (marker on disk) and let reconcile reap the snapshot the retry
+ * just wrote. The full run awaits these at its choke point
+ * ({@link awaitInFlightSourceMaterializations}); a retry that begins AFTER the
+ * full run registers joins via {@link awaitInFlightMaterialization}, so the two
+ * never reconcile against a half-written cache. Entries clear on settle.
+ */
+const inFlightSourceMaterializations = new Map<string, Set<Promise<unknown>>>();
+
+/** Track a single-source retry so a concurrent full run awaits it before reconciling. */
+function trackSourceMaterialization<T>(projectId: string, run: Promise<T>): Promise<T> {
+  let pending = inFlightSourceMaterializations.get(projectId);
+  if (!pending) {
+    pending = new Set();
+    inFlightSourceMaterializations.set(projectId, pending);
+  }
+  pending.add(run);
+  return run.finally(() => {
+    pending.delete(run);
+    if (pending.size === 0) inFlightSourceMaterializations.delete(projectId);
+  });
+}
+
+/**
+ * Settle every in-flight single-source retry for a project (resolves immediately
+ * when none is running). A full run awaits this BEFORE it reads the cache dir, so
+ * a retry's fresh snapshot is in place when the full run computes which files to
+ * keep — closing the reconcile-reap window described on the map above.
+ */
+export function awaitInFlightSourceMaterializations(projectId: string): Promise<unknown> {
+  const pending = inFlightSourceMaterializations.get(projectId);
+  if (!pending || pending.size === 0) return Promise.resolve();
+  return Promise.allSettled([...pending]);
+}
 
 /**
  * Materialize a project's external context (URLs/YouTube/PDFs/images) into a
@@ -109,9 +159,11 @@ const inFlightMaterializations = new Map<string, Promise<ContextMaterializationR
  *
  * Contract (relied on by the manager): NEVER rejects — any failure degrades to a
  * best-effort partial / empty result so session start is never blocked. Cheap on
- * unchanged context (fingerprint + TTL skip; no per-session re-fetch). Concurrent
- * calls for the same project dedupe to one in-flight run. Writes only under
- * `cwd/.context-cache/`.
+ * unchanged context (successful snapshots cheap-skip by fingerprint, known-bad
+ * sources cheap-skip by failure marker). Concurrent calls for the same project
+ * dedupe to one in-flight run. `forceRetryFailed` (the status popover's "Retry")
+ * re-attempts known-bad sources instead of honoring their markers. Writes only
+ * under `cwd/.context-cache/`.
  */
 export async function ensureProjectContextMaterialized(
   app: App,
@@ -120,19 +172,36 @@ export async function ensureProjectContextMaterialized(
   onProgress?: ContextMaterializeProgressFn,
   forceRetryFailed?: boolean
 ): Promise<ContextMaterializationResult> {
+  const force = forceRetryFailed ?? false;
   const existing = inFlightMaterializations.get(projectId);
   // Single-flight: a second concurrent caller joins the in-flight run and its
   // `onProgress` is intentionally dropped — the flight owner's sink already
   // drives the shared progress atom, so every reader still sees live counts.
-  // (A manual "Retry" that lands mid-flight therefore joins the running pass and
-  // its `forceRetryFailed` is a no-op — acceptable: the UI hides Retry while
-  // working, and the in-flight pass is already re-attempting the same sources.)
-  if (existing) return existing;
+  //
+  // A non-force caller always joins; a forced retry joins only an already-forced
+  // run. A forced retry that finds a NON-force run in flight (e.g. a background
+  // warm, which never owns the blocking atom and so is invisible to the manager's
+  // early-exit check) must NOT join it — that would cheap-skip the known-bad
+  // sources the user explicitly asked to re-fetch. Instead it SUPERSEDES below.
+  if (existing && (!force || existing.forceRetryFailed)) return existing.promise;
 
-  const promise = runMaterialize(app, projectId, cwd, onProgress, forceRetryFailed).finally(() => {
-    inFlightMaterializations.delete(projectId);
+  // Take over the slot SYNCHRONOUSLY so a concurrent session-create joins this
+  // forced run rather than the run it replaces — but defer the forced run's own
+  // disk work until the prior run settles, so the two never race-write the same
+  // hash-named cache files (the prior keeps the never-reject contract, so its
+  // rejection can't happen, but guard defensively).
+  const prior = existing?.promise;
+  const promise = (async () => {
+    if (prior) await prior.catch(() => undefined);
+    return runMaterialize(app, projectId, cwd, onProgress, force);
+  })().finally(() => {
+    // Guarded clear: a superseded prior run's own `finally` may fire after we've
+    // claimed the slot, so only delete when it still points at THIS promise.
+    if (inFlightMaterializations.get(projectId)?.promise === promise) {
+      inFlightMaterializations.delete(projectId);
+    }
   });
-  inFlightMaterializations.set(projectId, promise);
+  inFlightMaterializations.set(projectId, { promise, forceRetryFailed: force });
   return promise;
 }
 
@@ -147,7 +216,7 @@ export async function ensureProjectContextMaterialized(
  * and keeps the fresh snapshot.
  */
 export function awaitInFlightMaterialization(projectId: string): Promise<unknown> {
-  return inFlightMaterializations.get(projectId) ?? Promise.resolve();
+  return inFlightMaterializations.get(projectId)?.promise ?? Promise.resolve();
 }
 
 /**
@@ -227,6 +296,11 @@ async function runMaterialize(
     const cacheDir = joinVaultPath(getProjectFolderPath(record.filePath), CONTEXT_CACHE_DIR);
     const fs = createVaultContextCacheFs(app);
 
+    // Let any in-flight single-source retry finish writing before we read the
+    // cache dir, so its fresh snapshot is honored here (cheap-skip success) and
+    // survives this run's reconcile rather than being reaped as an orphan.
+    await awaitInFlightSourceMaterializations(projectId);
+
     const { entries, wantedFileNames, failures } = await materializeSources({
       cacheDir,
       fs,
@@ -234,7 +308,6 @@ async function runMaterialize(
       remotes,
       files,
       nowMs: Date.now(),
-      ttlMs: REMOTE_TTL_MS,
       forceRetryFailed,
       onProgress,
     });
@@ -310,8 +383,10 @@ function createConverters(): ContextConverters {
  * Conversion panel. Reuses the same cache dir / converters as the full run but
  * skips reconcile: it only (re)writes this one source's snapshot or failure
  * marker (materializeSources clears the marker on success), leaving every other
- * source untouched. Returns this source's failures (empty on success). Never
- * throws, mirroring the full run's contract.
+ * source untouched. Forces a retry past the failure marker (this IS the user's
+ * explicit retry) and registers itself as in-flight so a concurrent full run
+ * awaits it before reconciling. Returns this source's failures (empty on
+ * success). Never throws, mirroring the full run's contract.
  */
 export async function materializeProjectContextSource(
   app: App,
@@ -360,23 +435,25 @@ export async function materializeProjectContextSource(
     remotes = [{ type: item.kind, url: item.source }];
   }
 
-  try {
-    const { failures } = await materializeSources({
-      cacheDir,
-      fs,
-      converters: createConverters(),
-      remotes,
-      files,
-      nowMs: Date.now(),
-      ttlMs: REMOTE_TTL_MS,
-      forceRetryFailed: true,
-    });
-    return failures;
-  } catch (err) {
-    return [
-      { source: item.source, kind: item.kind, error: err2String(err), usedStaleSnapshot: false },
-    ];
-  }
+  const run = (async () => {
+    try {
+      const { failures } = await materializeSources({
+        cacheDir,
+        fs,
+        converters: createConverters(),
+        remotes,
+        files,
+        nowMs: Date.now(),
+        forceRetryFailed: true,
+      });
+      return failures;
+    } catch (err) {
+      return [
+        { source: item.source, kind: item.kind, error: err2String(err), usedStaleSnapshot: false },
+      ];
+    }
+  })();
+  return trackSourceMaterialization(projectId, run);
 }
 
 /** docs4llm's `response` is `unknown` — normalize to text for the cache file. */

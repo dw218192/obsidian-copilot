@@ -653,7 +653,7 @@ const AgentHomeInternal: React.FC<AgentHomeProps> = ({
         project={activeProject}
         hasConfiguredContextSource={!contextSummary.isEmpty}
         landing={isLanding}
-        onReindex={() => manager.rematerializeContext(activeProjectId, { forceRetryFailed: true })}
+        onReindex={() => manager.rematerializeContext(activeProjectId)}
         onRetryItem={(item) =>
           manager
             .rematerializeSource(activeProjectId, {

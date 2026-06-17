@@ -92,6 +92,16 @@ export interface AgentProjectContextLoadState {
    */
   failedSources?: FailedItem[];
   /**
+   * Sources the full materialization run is fetching/parsing RIGHT NOW, mirroring
+   * the legacy CAG `processingFiles` set. Published incrementally as each source
+   * starts and settles, so the popover renders a true queue: URLs (fetched in
+   * parallel) appear together while files (parsed sequentially) appear one at a
+   * time, and each flips to its real outcome the instant it settles — never
+   * waiting for the whole run. Only the single-flight owner publishes it; cleared
+   * on `done`. `failedSources` is likewise published incrementally during a run.
+   */
+  processingSources?: AgentInFlightSource[];
+  /**
    * Sources whose per-source retry is currently in flight (the popover row
    * "Retry"). Drives an optimistic "processing" state on that row so a click has
    * immediate feedback even when the retry ends up failing again. Never gates
@@ -106,8 +116,16 @@ export interface AgentRetryingSource {
   source: string;
 }
 
+/** A source the full materialization run is currently fetching/parsing. */
+export interface AgentInFlightSource {
+  kind: "web" | "youtube" | "file";
+  source: string;
+}
+
 /** Frozen empty list — referential stability for the "no retries in flight" case. */
 export const EMPTY_RETRYING_SOURCES: readonly AgentRetryingSource[] = Object.freeze([]);
+/** Frozen empty list — referential stability for the "nothing materializing" case. */
+export const EMPTY_PROCESSING_SOURCES: readonly AgentInFlightSource[] = Object.freeze([]);
 /** Per-project context-load state, keyed by projectId. Driven by AgentSessionManager's
  *  materialize step; read by AgentContextStatusIcon / AgentChatInput to show progress + gate send. */
 export const agentProjectContextLoadAtom = atom<Record<string, AgentProjectContextLoadState>>({});

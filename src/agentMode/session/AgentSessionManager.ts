@@ -3,6 +3,7 @@ import type CopilotPlugin from "@/main";
 import { AgentChatUIState } from "@/agentMode/session/AgentChatUIState";
 import {
   agentProjectContextLoadAtom,
+  type AgentInFlightSource,
   type AgentProjectContextLoadState,
   type ContextLoadStepCount,
   type FailedItem,
@@ -16,7 +17,11 @@ import {
   type ContextMaterializationResult,
   type ContextMaterializeProgress,
 } from "@/context/projectContextMaterializer";
-import type { MaterializedSourceType, SourceFailure } from "@/context/contextCacheStore";
+import type {
+  MaterializedSourceType,
+  MaterializeSourceIdentity,
+  SourceFailure,
+} from "@/context/contextCacheStore";
 import { err2String } from "@/utils";
 import type { ChatHistoryItem } from "@/components/chat-components/ChatHistoryPopover";
 import { fileToHistoryItem, readChatPathProjectId } from "@/utils/chatHistoryUtils";
@@ -140,6 +145,36 @@ function toFailedItem(failure: SourceFailure): FailedItem {
     error: failure.error,
     usedStaleSnapshot: failure.usedStaleSnapshot,
   };
+}
+
+/** Whether a {@link FailedItem} refers to the same source as a lifecycle event
+ * (the cache layer's `"file"` kind is the atom's `"nonMd"`). */
+function failedItemIsSource(failed: FailedItem, item: MaterializeSourceIdentity): boolean {
+  if (failed.path !== item.source) return false;
+  return item.kind === "file" ? failed.type === "nonMd" : failed.type === item.kind;
+}
+
+/** Add a source to the live "processing" set (no-op if already present). Returns a
+ * NEW array on change so the atom publish is referentially distinct. */
+function addProcessingSource(
+  list: AgentInFlightSource[],
+  item: MaterializeSourceIdentity
+): AgentInFlightSource[] {
+  if (list.some((s) => s.kind === item.kind && s.source === item.source)) return list;
+  return [...list, { kind: item.kind, source: item.source }];
+}
+
+/** Remove a source from the live "processing" set. */
+function removeProcessingSource(
+  list: AgentInFlightSource[],
+  item: MaterializeSourceIdentity
+): AgentInFlightSource[] {
+  return list.filter((s) => !(s.kind === item.kind && s.source === item.source));
+}
+
+/** Append a freshly-settled failure, dropping any prior entry for the same source. */
+function upsertFailedItem(list: FailedItem[], failure: FailedItem): FailedItem[] {
+  return [...list.filter((f) => !(f.path === failure.path && f.type === failure.type)), failure];
 }
 
 export type PermissionPrompter = (req: PermissionPrompt) => Promise<PermissionDecision>;
@@ -984,9 +1019,15 @@ export class AgentSessionManager {
       prefetch?: ContextLoadStepCount;
       parsed?: ContextLoadStepCount;
     } = {};
-    // Latest per-source failures (republished on every publish; the `failures`
-    // progress variant carries data only and never advances `phase`).
+    // Per-source state mirroring the legacy CAG tracker: `processingSources` is
+    // the live "in flight" set, `failedSources` accrues settled failures. Both
+    // publish incrementally so the popover renders a true queue; the materializer
+    // sends a final `failures` list that reconciles `failedSources` at the end.
     let failedSources: FailedItem[] = [];
+    let processingSources: AgentInFlightSource[] = [];
+    // The latest step phase, so item-lifecycle publishes (which carry no phase of
+    // their own) keep the loading card on the current step.
+    let stepPhase: "resolve" | "prefetch" | "parse" = "resolve";
 
     // Own the atom only when no concurrent run is already driving it. The
     // materializer single-flights, so a second caller would otherwise (a) seed a
@@ -1002,18 +1043,57 @@ export class AgentSessionManager {
       this.setContextLoadState(projectId, { phase: "resolve", blocking: true });
     }
 
+    // Re-emit the running state with the current counts + per-source sets. Empty
+    // `processingSources` publishes as `undefined` (the adapter falls back to a
+    // frozen empty), matching the `retryingSources` referential-stability pattern.
+    const publishProgress = () => {
+      this.setContextLoadState(projectId, {
+        phase: stepPhase,
+        blocking: true,
+        ...counts,
+        failedSources,
+        processingSources: processingSources.length > 0 ? processingSources : undefined,
+      });
+    };
+
     const onProgress = ownsPublish
       ? (progress: ContextMaterializeProgress) => {
-          if (progress.phase === "failures") {
-            // Data-only: record failures, keep the current phase unchanged.
-            failedSources = progress.failures.map(toFailedItem);
-            return;
+          switch (progress.phase) {
+            case "failures":
+              // Final reconciliation of the run's failures (data-only; the
+              // terminal `done` publish carries the authoritative list).
+              failedSources = progress.failures.map(toFailedItem);
+              return;
+            case "itemStart":
+              processingSources = addProcessingSource(processingSources, progress.item);
+              failedSources = failedSources.filter((f) => !failedItemIsSource(f, progress.item));
+              publishProgress();
+              return;
+            case "itemFailed":
+              processingSources = removeProcessingSource(processingSources, progress.item);
+              failedSources = upsertFailedItem(failedSources, toFailedItem(progress.failure));
+              publishProgress();
+              return;
+            case "itemSettled":
+              processingSources = removeProcessingSource(processingSources, progress.item);
+              publishProgress();
+              return;
+            case "resolve":
+              counts.resolved = progress.resolved;
+              stepPhase = "resolve";
+              publishProgress();
+              return;
+            case "prefetch":
+              counts.prefetch = { done: progress.done, total: progress.total };
+              stepPhase = "prefetch";
+              publishProgress();
+              return;
+            case "parse":
+              counts.parsed = { done: progress.done, total: progress.total };
+              stepPhase = "parse";
+              publishProgress();
+              return;
           }
-          if (progress.phase === "resolve") counts.resolved = progress.resolved;
-          else if (progress.phase === "prefetch")
-            counts.prefetch = { done: progress.done, total: progress.total };
-          else counts.parsed = { done: progress.done, total: progress.total };
-          this.setContextLoadState(projectId, { phase: progress.phase, blocking: true, ...counts });
         }
       : undefined;
 
@@ -1021,7 +1101,7 @@ export class AgentSessionManager {
       .then((ctx) => {
         if (ownsPublish) {
           // Always carry `failedSources` (empty when clean) so a prior run's
-          // failures never linger on the projectId-keyed atom.
+          // failures never linger; the run is done, so nothing is processing.
           this.setContextLoadState(projectId, {
             phase: "done",
             blocking: false,
@@ -1056,16 +1136,20 @@ export class AgentSessionManager {
    * Re-run a project's context materialization on demand — the status popover's
    * "Retry" action. Fire-and-forget: progress/failures republish through
    * {@link agentProjectContextLoadAtom} exactly like a session-create run. Passes
-   * `forceRetryFailed` so the negative cache is bypassed and known-bad sources are
-   * re-attempted now. A no-op for the global scope (no per-project context).
+   * `forceRetryFailed` so known-bad sources are re-fetched instead of honoring
+   * their persisted failure markers (the automatic path cheap-skips them). A
+   * no-op for the global scope (no per-project context).
    *
-   * If a session-create materialization is already in flight, the single-flight
-   * guard makes this join it (and `forceRetryFailed` is moot) — acceptable, since
-   * the in-flight pass is already re-attempting those sources and the UI hides
-   * Retry while a run is active.
+   * Early-exits while a run already owns the load atom (`blocking`), mirroring
+   * {@link rematerializeSource}: joining the in-flight session-create run would
+   * let its cheap-skip swallow the force, so the user's Retry would do nothing.
+   * Returns whether a real forced run started (so the caller can defer the
+   * post-retry landing refresh).
    */
-  rematerializeContext(projectId: ProjectScopeId, opts?: { forceRetryFailed?: boolean }): boolean {
+  rematerializeContext(projectId: ProjectScopeId): boolean {
     if (projectId === GLOBAL_SCOPE) return false;
+    // A session-create run owns the atom while blocking; don't fold the force in.
+    if (settingsStore.get(agentProjectContextLoadAtom)[projectId]?.blocking) return false;
     let cwd: string;
     try {
       cwd = this.resolveSessionCwd(projectId);
@@ -1079,7 +1163,13 @@ export class AgentSessionManager {
       });
       return false;
     }
-    void this.beginContextMaterialization(projectId, cwd, opts?.forceRetryFailed);
+    // Start the forced pass SYNCHRONOUSLY so it claims the materializer's
+    // single-flight slot before this returns: a background warm (a source edit)
+    // runs through that guard without owning the blocking atom, so the check
+    // above can't see it — but the forced run supersedes it (see
+    // {@link ensureProjectContextMaterialized}), and any landing refresh the
+    // returned `true` triggers then joins THIS forced run, not the stale warm.
+    void this.beginContextMaterialization(projectId, cwd, true);
     // Reason: report whether a real run started so the caller can defer the
     // post-retry landing refresh (skipped for the no-op scopes above).
     return true;
