@@ -6,6 +6,7 @@ import { checkIsPlusUser } from "@/plusUtils";
 import { getSettings } from "@/settings/model";
 import { getSystemPromptWithMemory } from "@/system-prompts/systemPromptBuilder";
 import { initializeBuiltinTools } from "@/tools/builtinTools";
+import { withNativeWebSearch } from "@/tools/forkConfig";
 import { ToolRegistry } from "@/tools/ToolRegistry";
 import { StructuredTool } from "@langchain/core/tools";
 import { Runnable } from "@langchain/core/runnables";
@@ -556,7 +557,11 @@ export class AutonomousAgentChainRunner extends CopilotPlusChainRunner {
           `Agent mode requires a model with tool calling support.`
       );
     }
-    const boundModel = chatModel.bindTools(availableTools);
+    // Cast because the array may mix StructuredTools with a raw built-in tool spec
+    // (the Responses-API web_search tool added by withNativeWebSearch).
+    const boundModel = chatModel.bindTools(
+      withNativeWebSearch(chatModel, availableTools) as StructuredTool[]
+    );
 
     const loopDeps: AgentLoopDeps = {
       availableTools,

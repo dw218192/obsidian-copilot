@@ -22,6 +22,7 @@ import { ToolManager } from "@/tools/toolManager";
 import { ToolResultFormatter } from "@/tools/ToolResultFormatter";
 import { ToolRegistry } from "@/tools/ToolRegistry";
 import { initializeBuiltinTools } from "@/tools/builtinTools";
+import { withNativeWebSearch } from "@/tools/forkConfig";
 import { localSearchTool, webSearchTool } from "@/tools/SearchTools";
 import { updateMemoryTool } from "@/tools/memoryTools";
 import { extractChatHistory } from "@/utils";
@@ -126,8 +127,12 @@ export class CopilotPlusChainRunner extends BaseChainRunner {
       };
     }
 
-    // Bind tools to the model for native function calling
-    const boundModel = modelWithTools.bindTools(availableTools);
+    // Bind tools to the model for native function calling. withNativeWebSearch adds
+    // the Responses-API built-in web_search tool for models that support it; cast
+    // because the array then mixes StructuredTools with a raw built-in tool spec.
+    const boundModel = modelWithTools.bindTools(
+      withNativeWebSearch(chatModel, availableTools) as StructuredTool[]
+    );
 
     // Build a lightweight planning prompt (no XML format instructions needed)
     // Reason: when an active note is attached in this turn, tell the planner not
