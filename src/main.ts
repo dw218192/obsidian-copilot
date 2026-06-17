@@ -14,6 +14,7 @@ import { LoadChatHistoryModal } from "@/components/modals/LoadChatHistoryModal";
 
 import { registerContextMenu } from "@/commands/contextMenu";
 import { CustomCommandRegister } from "@/commands/customCommandRegister";
+import { PdfSnipController } from "@/pdfSnip/PdfSnipController";
 import { migrateCommands, suggestDefaultCommands } from "@/commands/migrator";
 import { migrateSystemPromptsFromSettings } from "@/system-prompts/migration";
 import { SystemPromptRegister } from "@/system-prompts/systemPromptRegister";
@@ -99,6 +100,9 @@ export default class CopilotPlugin extends Plugin {
   userMemoryManager: UserMemoryManager;
   quickAskController: QuickAskController;
   chatSelectionHighlightController: ChatSelectionHighlightController;
+  pdfSnipController: PdfSnipController;
+  /** Images queued from outside React (e.g. PDF snips) to be added as chat context. */
+  pendingContextImages: File[] = [];
   private selectionDebounceTimer?: number;
   private selectionChangeHandler?: () => void;
   private selectionListenerDocument?: Document;
@@ -260,6 +264,17 @@ export default class CopilotPlugin extends Plugin {
         .then(() => migrateSystemPromptsFromSettings(this.app.vault));
     });
 
+    // PDF snip: add a "Snip region to Copilot" action to PDF views. Re-scan on
+    // layout/active-leaf changes so newly opened PDFs get the action too.
+    this.pdfSnipController = new PdfSnipController(this.app, (file) => this.addImageToChat(file));
+    this.app.workspace.onLayoutReady(() => this.pdfSnipController.decoratePdfViews());
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => this.pdfSnipController.decoratePdfViews())
+    );
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => this.pdfSnipController.decoratePdfViews())
+    );
+
     // Initialize automatic selection handler
     this.initSelectionHandler();
 
@@ -282,6 +297,9 @@ export default class CopilotPlugin extends Plugin {
 
     // Cleanup chat selection highlight controller
     this.chatSelectionHighlightController?.cleanup();
+
+    // Remove PDF snip overlay/actions
+    this.pdfSnipController?.dispose();
 
     if (this.projectManager) {
       this.projectManager.onunload();
@@ -618,6 +636,20 @@ export default class CopilotPlugin extends Plugin {
     } else {
       void this.activateView();
     }
+  }
+
+  /**
+   * Add an in-memory image as chat context, opening/revealing the chat view.
+   * The image is queued on pendingContextImages and the chat drains it on the
+   * ADD_IMAGE_TO_CHAT event (and once on mount, covering a freshly created view).
+   */
+  async addImageToChat(file: File): Promise<void> {
+    this.pendingContextImages.push(file);
+    await this.activateView();
+    const copilotView = this.app.workspace
+      .getLeavesOfType(CHAT_VIEWTYPE)
+      .find((leaf) => leaf.view instanceof CopilotView)?.view as CopilotView | undefined;
+    copilotView?.eventTarget.dispatchEvent(new CustomEvent(EVENT_NAMES.ADD_IMAGE_TO_CHAT));
   }
 
   async activateView(): Promise<void> {

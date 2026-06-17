@@ -1010,6 +1010,7 @@ export const EVENT_NAMES = {
   CHAT_IS_VISIBLE: "chat-is-visible",
   ACTIVE_LEAF_CHANGE: "active-leaf-change",
   ABORT_STREAM: "abort-stream",
+  ADD_IMAGE_TO_CHAT: "add-image-to-chat",
 };
 
 export enum ABORT_REASON {

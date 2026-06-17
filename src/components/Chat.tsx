@@ -645,6 +645,24 @@ const ChatInternal: React.FC<ChatProps & { chatInput: ReturnType<typeof useChatI
     };
   }, [eventTarget, chatInput]);
 
+  // Drain images queued from outside React (e.g. a PDF snip). The producer
+  // pushes File objects onto plugin.pendingContextImages and fires the event;
+  // we also drain once on mount to cover the case where the chat view was just
+  // created and the event fired before this listener attached.
+  useEffect(() => {
+    const drainPendingImages = () => {
+      const pending = plugin.pendingContextImages;
+      if (pending && pending.length > 0) {
+        handleAddImage(pending.splice(0, pending.length));
+      }
+    };
+    drainPendingImages();
+    eventTarget?.addEventListener(EVENT_NAMES.ADD_IMAGE_TO_CHAT, drainPendingImages);
+    return () => {
+      eventTarget?.removeEventListener(EVENT_NAMES.ADD_IMAGE_TO_CHAT, drainPendingImages);
+    };
+  }, [eventTarget, plugin, handleAddImage]);
+
   const handleDelete = useCallback(
     async (messageIndex: number) => {
       const messageToDelete = chatHistory[messageIndex];
