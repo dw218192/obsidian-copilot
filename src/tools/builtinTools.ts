@@ -2,6 +2,7 @@ import { getSettings } from "@/settings/model";
 import { Vault } from "obsidian";
 import { isDesktopRuntime } from "@/services/obsidianCli/ObsidianCliClient";
 import { editFileTool, writeFileTool } from "./ComposerTools";
+import { FORK_DISABLED_TOOL_IDS } from "./forkConfig";
 import { createGetFileTreeTool } from "./FileTreeTools";
 import { updateMemoryTool } from "./memoryTools";
 import { readNoteTool } from "./NoteTools";
@@ -551,8 +552,11 @@ export function initializeBuiltinTools(vault?: Vault): void {
     // Clear any existing tools
     registry.clear();
 
-    // Register all built-in tools
-    registry.registerAll(BUILTIN_TOOLS);
+    // Register all built-in tools, minus any disabled in this fork (e.g. paid
+    // Brevilabs-backed tools that can't work without a license).
+    registry.registerAll(
+      BUILTIN_TOOLS.filter((definition) => !FORK_DISABLED_TOOL_IDS.has(definition.metadata.id))
+    );
 
     // Register vault-dependent tools if vault is available
     if (vault) {
