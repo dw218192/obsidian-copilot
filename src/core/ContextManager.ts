@@ -17,7 +17,8 @@ import { Mention } from "@/mentions/Mention";
 import { getSettings } from "@/settings/model";
 import { FileParserManager } from "@/tools/FileParserManager";
 import { ChatMessage, MessageContext } from "@/types/message";
-import { extractNoteFiles, getNotesFromPath, getNotesFromTags } from "@/utils";
+import { extractNoteFiles, getNotesFromPath, getNotesFromTags, isTextReadableFile } from "@/utils";
+import { FORK_AUTOCONTEXT_TEXT_ONLY } from "@/tools/forkConfig";
 import { TFile, Vault } from "obsidian";
 import { MessageRepository } from "./MessageRepository";
 
@@ -113,9 +114,15 @@ export class ContextManager {
       // Filter out notes already in L2 to avoid duplication
       const notes = contextNotes.filter((note) => !l2Paths.has(note.path));
 
+      // Fork: don't auto-inline non-text-readable active files (PDFs/docs). That
+      // path goes through the paid pdf4llm backend and would dump a whole document
+      // into the prompt; the agent reads PDFs on demand via the local pdf_* tools.
+      const autoIncludeActiveNote =
+        includeActiveNote && (!FORK_AUTOCONTEXT_TEXT_ONLY || isTextReadableFile(activeNote));
+
       // Add active note if requested and not already in L2
       if (
-        includeActiveNote &&
+        autoIncludeActiveNote &&
         chainType !== ChainType.PROJECT_CHAIN &&
         activeNote &&
         !processedNotePaths.has(activeNote.path) &&
@@ -129,7 +136,7 @@ export class ContextManager {
         fileParserManager,
         vault,
         notes,
-        includeActiveNote,
+        autoIncludeActiveNote,
         activeNote,
         chainType
       );

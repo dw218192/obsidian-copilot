@@ -27,6 +27,16 @@ export const FORK_DISABLED_TOOL_IDS: ReadonlySet<string> = new Set([
 export const FORK_ENABLE_NATIVE_WEB_SEARCH: boolean = true;
 
 /**
+ * When true, the "auto add active content to context" feature only auto-inlines
+ * text-readable files (md/canvas/base). Non-text files (PDFs, docs) are NOT
+ * auto-inlined, because that path goes through the paid pdf4llm backend — which
+ * can't work without a license and would dump an entire document into the prompt.
+ * The agent reads PDFs on demand via the local pdf_* tools (or the snip) instead.
+ * Set to false to restore upstream behavior. Not for upstreaming.
+ */
+export const FORK_AUTOCONTEXT_TEXT_ONLY: boolean = true;
+
+/**
  * Append the built-in `web_search` tool to a bindTools() tools array when the
  * given chat model uses the OpenAI Responses API; otherwise return the array
  * unchanged. Whether the model actually invokes it is up to the model (reasoning

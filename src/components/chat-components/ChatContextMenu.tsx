@@ -17,7 +17,8 @@ import { ChainType } from "@/chainType";
 import { Separator } from "@/components/ui/separator";
 import { useChainType, useIndexingProgress } from "@/aiParams";
 import { useProjectContextStatus } from "@/hooks/useProjectContextStatus";
-import { getDomainFromUrl, isPlusChain, openFileInWorkspace } from "@/utils";
+import { getDomainFromUrl, isPlusChain, isTextReadableFile, openFileInWorkspace } from "@/utils";
+import { FORK_AUTOCONTEXT_TEXT_ONLY } from "@/tools/forkConfig";
 import { mergeWebTabContexts } from "@/utils/urlNormalization";
 import { AtMentionTypeahead } from "./AtMentionTypeahead";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -160,7 +161,13 @@ export const ChatContextMenu: React.FC<ChatContextMenuProps> = ({
   // Any selection hides both active note and active web tab
   const hasAnySelection = selectedTextContexts.length > 0;
 
-  const activeNoteVisible = includeActiveNote && !hasAnySelection && Boolean(currentActiveFile);
+  // Fork: don't surface a PDF/doc as auto-included context (it isn't auto-inlined;
+  // the agent reads it via the local pdf_* tools instead).
+  const activeNoteVisible =
+    includeActiveNote &&
+    !hasAnySelection &&
+    Boolean(currentActiveFile) &&
+    (!FORK_AUTOCONTEXT_TEXT_ONLY || isTextReadableFile(currentActiveFile));
   const activeWebTabVisible =
     includeActiveWebTab && !hasAnySelection && Boolean(activeWebTab) && Platform.isDesktopApp;
 
