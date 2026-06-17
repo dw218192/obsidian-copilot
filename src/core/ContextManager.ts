@@ -19,6 +19,7 @@ import { FileParserManager } from "@/tools/FileParserManager";
 import { ChatMessage, MessageContext } from "@/types/message";
 import { extractNoteFiles, getNotesFromPath, getNotesFromTags, isTextReadableFile } from "@/utils";
 import { FORK_AUTOCONTEXT_TEXT_ONLY } from "@/tools/forkConfig";
+import { buildActivePdfPageContextBlock } from "@/tools/pdf/pdfTools";
 import { TFile, Vault } from "obsidian";
 import { MessageRepository } from "./MessageRepository";
 
@@ -131,7 +132,7 @@ export class ContextManager {
         notes.push(activeNote);
       }
 
-      const noteContextAddition = await this.contextProcessor.processContextNotes(
+      let noteContextAddition = await this.contextProcessor.processContextNotes(
         processedNotePaths,
         fileParserManager,
         vault,
@@ -140,6 +141,11 @@ export class ContextManager {
         activeNote,
         chainType
       );
+
+      // Fork: for an active PDF, auto-include just the current (visible) page via
+      // local extraction, instead of the whole document. Rides the note-context
+      // plumbing (contextPortion + envelope) by appending to noteContextAddition.
+      noteContextAddition += await buildActivePdfPageContextBlock(includeActiveNote, activeNote);
 
       // Add processed context notes to tracking sets
       notes.forEach((note) => {

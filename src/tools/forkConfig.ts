@@ -37,6 +37,14 @@ export const FORK_ENABLE_NATIVE_WEB_SEARCH: boolean = true;
 export const FORK_AUTOCONTEXT_TEXT_ONLY: boolean = true;
 
 /**
+ * When true, auto-context includes the **current page** of the active PDF (the
+ * page the user is viewing), extracted locally via pdf.js — a bounded, single-page
+ * alternative to inlining the whole document. The agent can still read other pages
+ * on demand via the pdf_* tools. Set to false to disable. Not for upstreaming.
+ */
+export const FORK_AUTO_PDF_CURRENT_PAGE: boolean = true;
+
+/**
  * Append the built-in `web_search` tool to a bindTools() tools array when the
  * given chat model uses the OpenAI Responses API; otherwise return the array
  * unchanged. Whether the model actually invokes it is up to the model (reasoning

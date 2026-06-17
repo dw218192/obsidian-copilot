@@ -1,5 +1,7 @@
+import { logError } from "@/logger";
 import { TFile } from "obsidian";
 import { createLangChainTool } from "../createLangChainTool";
+import { FORK_AUTO_PDF_CURRENT_PAGE } from "../forkConfig";
 import { getOutline, getPageText, looksScanned, openPdf, PdfDocHandle } from "./pdfDocument";
 import { z } from "zod";
 
@@ -302,4 +304,62 @@ export const pdfReadPagesTool = createLangChainTool({
 export function clearPdfToolCaches(): void {
   docCache.clear();
   pageTextCache.clear();
+}
+
+/** Max characters of the current PDF page to inline into auto-context. */
+const ACTIVE_PDF_PAGE_MAX_CHARS = 8000;
+
+/** Minimal XML escaping for inlined page text. */
+function escapeXmlMinimal(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Read the current (visible) page number of the open PDF view showing `file`.
+ * Uses Obsidian's internal PDF viewer state, so it's defensive about shape.
+ */
+function getActivePdfCurrentPage(file: TFile): number | null {
+  for (const leaf of app.workspace.getLeavesOfType("pdf")) {
+    const view = leaf.view as unknown as {
+      file?: { path?: string };
+      viewer?: { child?: { pdfViewer?: { currentPageNumber?: number } } };
+    };
+    if (view?.file?.path === file.path) {
+      const n = view?.viewer?.child?.pdfViewer?.currentPageNumber;
+      if (typeof n === "number" && n >= 1) return n;
+    }
+  }
+  return null;
+}
+
+/**
+ * Build an auto-context block for the current page of the active PDF, extracted
+ * locally (no pdf4llm). Returns "" when disabled, not a PDF, the page is unknown,
+ * or the page has no extractable text (e.g. scanned — read it as an image instead).
+ */
+export async function buildActivePdfPageContextBlock(
+  includeActiveNote: boolean,
+  activeFile: TFile | null
+): Promise<string> {
+  if (!FORK_AUTO_PDF_CURRENT_PAGE || !includeActiveNote) return "";
+  if (!activeFile || activeFile.extension !== "pdf") return "";
+  const page = getActivePdfCurrentPage(activeFile);
+  if (!page) return "";
+  try {
+    const { handle, key } = await getDoc(activeFile);
+    if (page > handle.numPages) return "";
+    const text = (await cachedPageText(handle, key, page)).trim();
+    if (text.length === 0) return ""; // scanned / no text layer
+    const capped =
+      text.length > ACTIVE_PDF_PAGE_MAX_CHARS
+        ? text.slice(0, ACTIVE_PDF_PAGE_MAX_CHARS) + "\n…[truncated]"
+        : text;
+    return (
+      `\n\n<active_pdf_page>\n<path>${activeFile.path}</path>\n<page>${page}</page>\n` +
+      `<total_pages>${handle.numPages}</total_pages>\n<content>\n${escapeXmlMinimal(capped)}\n</content>\n</active_pdf_page>`
+    );
+  } catch (err) {
+    logError("[pdfTools] Failed to build active PDF page context", err);
+    return "";
+  }
 }

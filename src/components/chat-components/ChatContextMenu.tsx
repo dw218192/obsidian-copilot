@@ -18,7 +18,7 @@ import { Separator } from "@/components/ui/separator";
 import { useChainType, useIndexingProgress } from "@/aiParams";
 import { useProjectContextStatus } from "@/hooks/useProjectContextStatus";
 import { getDomainFromUrl, isPlusChain, isTextReadableFile, openFileInWorkspace } from "@/utils";
-import { FORK_AUTOCONTEXT_TEXT_ONLY } from "@/tools/forkConfig";
+import { FORK_AUTO_PDF_CURRENT_PAGE, FORK_AUTOCONTEXT_TEXT_ONLY } from "@/tools/forkConfig";
 import { mergeWebTabContexts } from "@/utils/urlNormalization";
 import { AtMentionTypeahead } from "./AtMentionTypeahead";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -161,13 +161,14 @@ export const ChatContextMenu: React.FC<ChatContextMenuProps> = ({
   // Any selection hides both active note and active web tab
   const hasAnySelection = selectedTextContexts.length > 0;
 
-  // Fork: don't surface a PDF/doc as auto-included context (it isn't auto-inlined;
-  // the agent reads it via the local pdf_* tools instead).
+  // Fork: the active file contributes to auto-context if it's text-readable, or if
+  // it's a PDF and current-page auto-context is on (we inline just the visible page).
+  const activeFileAutoIncluded =
+    !FORK_AUTOCONTEXT_TEXT_ONLY ||
+    isTextReadableFile(currentActiveFile) ||
+    (FORK_AUTO_PDF_CURRENT_PAGE && currentActiveFile?.extension === "pdf");
   const activeNoteVisible =
-    includeActiveNote &&
-    !hasAnySelection &&
-    Boolean(currentActiveFile) &&
-    (!FORK_AUTOCONTEXT_TEXT_ONLY || isTextReadableFile(currentActiveFile));
+    includeActiveNote && !hasAnySelection && Boolean(currentActiveFile) && activeFileAutoIncluded;
   const activeWebTabVisible =
     includeActiveWebTab && !hasAnySelection && Boolean(activeWebTab) && Platform.isDesktopApp;
 
