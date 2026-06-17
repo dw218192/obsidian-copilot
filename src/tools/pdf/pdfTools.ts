@@ -400,5 +400,13 @@ export async function buildActivePdfPageContextBlock(
   const body = content
     ? `<content>\n${escapeXmlMinimal(content)}\n</content>\n`
     : `<note>Page text unavailable (scanned page or no text layer). Ask the user to snip this page for a vision read.</note>\n`;
-  return `\n\n<active_pdf_page>\n<path>${activeFile.path}</path>\n<page>${page}</page>\n${totalAttr}${body}</active_pdf_page>`;
+  // Use the registered <embedded_pdf> tag (not a custom one): the context-segment
+  // parser only keeps registered block tags, so a custom tag would be dropped
+  // before reaching the model. The <name> carries the page so each page is a
+  // distinct context artifact (and updates as the user scrolls).
+  const name = `${activeFile.basename} — current page ${page}${totalPages ? ` of ${totalPages}` : ""}`;
+  return (
+    `\n\n<embedded_pdf>\n<name>${escapeXmlMinimal(name)}</name>\n<path>${activeFile.path}</path>\n` +
+    `<page>${page}</page>\n${totalAttr}${body}</embedded_pdf>`
+  );
 }
