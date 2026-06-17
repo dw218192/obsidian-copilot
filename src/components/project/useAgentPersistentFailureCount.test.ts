@@ -1,7 +1,7 @@
 import type { AgentProjectContextLoadState, ProjectConfig } from "@/aiParams";
 import * as adapter from "@/components/project/agentProcessingAdapter";
 import { useAgentPersistentFailureCount } from "@/components/project/useAgentPersistentFailureCount";
-import { failureMarkerName } from "@/context/contextCacheStore";
+import { CACHE_SCHEMA_VERSION, failureMarkerName } from "@/context/contextCacheStore";
 import * as projectState from "@/projects/state";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { App } from "obsidian";
@@ -30,7 +30,7 @@ const webMarkerDisk = {
   markersByName: new Map([
     [
       failureMarkerName("web", "https://a.com"),
-      { source: "https://a.com", kind: "web" as const, error: "boom", failedAt: 1 },
+      { schemaVersion: CACHE_SCHEMA_VERSION, source: "https://a.com", kind: "web" as const, error: "boom", failedAt: 1 }, // prettier-ignore
     ],
   ]),
   fingerprintsByName: new Map<string, string>(),

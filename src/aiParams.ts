@@ -3,6 +3,7 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 
 import { ModelCapability, ReasoningEffort, Verbosity } from "@/constants";
+import type { MaterializedSourceType } from "@/context/contextCacheStore";
 import { settingsAtom, settingsStore } from "@/settings/model";
 import { SelectedTextContext } from "@/types/message";
 import { atom, useAtom } from "jotai";
@@ -112,13 +113,13 @@ export interface AgentProjectContextLoadState {
 
 /** A source whose per-source retry is currently in flight (popover row "Retry"). */
 export interface AgentRetryingSource {
-  kind: "web" | "youtube" | "file";
+  kind: MaterializedSourceType;
   source: string;
 }
 
 /** A source the full materialization run is currently fetching/parsing. */
 export interface AgentInFlightSource {
-  kind: "web" | "youtube" | "file";
+  kind: MaterializedSourceType;
   source: string;
 }
 

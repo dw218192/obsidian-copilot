@@ -109,6 +109,35 @@ describe("materializeSources", () => {
     expect(conv.parseFile).toHaveBeenCalledTimes(1);
   });
 
+  it("stamps the cache schema version into written snapshots", async () => {
+    const fs = memFs();
+    const { entries } = await materializeSources({
+      cacheDir: CACHE_DIR,
+      fs,
+      converters: converters(),
+      remotes: [{ type: "web", url: "https://a.com" }],
+      files: [],
+      nowMs: T0,
+    });
+    expect(fs.files.get(join(CACHE_DIR, entries[0].cacheFileName))!).toContain('"schemaVersion":1');
+  });
+
+  it("re-materializes a snapshot whose schema version no longer matches (not cheap-skipped)", async () => {
+    const fs = memFs();
+    const conv = converters();
+    const remotes: RemoteSource[] = [{ type: "web", url: "https://a.com" }];
+
+    const { entries } = await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0 }); // prettier-ignore
+    // Simulate a future format change: an on-disk snapshot from a different
+    // schema version. The version gate must treat it as a miss, not cheap-skip.
+    const key = join(CACHE_DIR, entries[0].cacheFileName);
+    fs.files.set(key, fs.files.get(key)!.replace('"schemaVersion":1', '"schemaVersion":999'));
+
+    await materializeSources({ cacheDir: CACHE_DIR, fs, converters: conv, remotes, files: [], nowMs: T0 + DAY }); // prettier-ignore
+
+    expect(conv.fetchRemote).toHaveBeenCalledTimes(2); // re-fetched, not skipped
+  });
+
   it("re-parses a file when its mtime/size fingerprint changes", async () => {
     const fs = memFs();
     const conv = converters();
@@ -553,5 +582,21 @@ describe("reconcileCache", () => {
     // A leftover CONTEXT.md from a prior version is now reconciled away.
     expect(fs.files.has(join(CACHE_DIR, MANIFEST_FILE_NAME))).toBe(false);
     expect(fs.files.has(join(CACHE_DIR, "user-notes.md"))).toBe(true);
+  });
+
+  it("prunes every materialized source type (incl. youtube snapshots and failure markers)", async () => {
+    // Guards the derived owned-file pattern: a regex that only matched web/file
+    // would leak youtube orphans. Adding a 4th type must stay covered here too.
+    const fs = memFs({
+      [join(CACHE_DIR, "youtube-abc0001.md")]: "obsolete",
+      [join(CACHE_DIR, "failed-youtube-abc0002.json")]: "{}",
+      [join(CACHE_DIR, "keep-me.md")]: "not ours",
+    });
+
+    await reconcileCache(fs, CACHE_DIR, new Set());
+
+    expect(fs.files.has(join(CACHE_DIR, "youtube-abc0001.md"))).toBe(false);
+    expect(fs.files.has(join(CACHE_DIR, "failed-youtube-abc0002.json"))).toBe(false);
+    expect(fs.files.has(join(CACHE_DIR, "keep-me.md"))).toBe(true);
   });
 });

@@ -4,7 +4,11 @@ import {
   type AgentCacheDirState,
   type AgentProcessingSource,
 } from "@/components/project/agentProcessingAdapter";
-import { cacheFileName, failureMarkerName } from "@/context/contextCacheStore";
+import {
+  CACHE_SCHEMA_VERSION,
+  cacheFileName,
+  failureMarkerName,
+} from "@/context/contextCacheStore";
 
 const URL_A = "https://a.example.com/page";
 const PDF = "docs/spec.pdf";
@@ -74,7 +78,7 @@ describe("buildAgentProcessingItems", () => {
       markersByName: new Map([
         [
           failureMarkerName("web", URL_A),
-          { source: URL_A, kind: "web" as const, error: "fetch 404", failedAt: 1 },
+          { schemaVersion: CACHE_SCHEMA_VERSION, source: URL_A, kind: "web" as const, error: "fetch 404", failedAt: 1 }, // prettier-ignore
         ],
       ]),
     });
@@ -158,7 +162,7 @@ describe("buildAgentProcessingItems", () => {
       markersByName: new Map([
         [
           failureMarkerName("web", URL_A),
-          { source: URL_A, kind: "web" as const, error: "fetch 404", failedAt: 1 },
+          { schemaVersion: CACHE_SCHEMA_VERSION, source: URL_A, kind: "web" as const, error: "fetch 404", failedAt: 1 }, // prettier-ignore
         ],
       ]),
     });
@@ -190,6 +194,7 @@ describe("buildAgentProcessingItems", () => {
           [
             markerName,
             {
+              schemaVersion: CACHE_SCHEMA_VERSION,
               source: PDF,
               kind: "file" as const,
               error: "parse boom",

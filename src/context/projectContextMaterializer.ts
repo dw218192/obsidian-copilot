@@ -517,6 +517,17 @@ function resolveFolderPaths(
  * shared by several notes lists EVERY match (matching the inclusion semantics),
  * not just the first. A pattern with no matching file is still listed by its raw
  * `[[Title]]` form so the source is never dropped.
+ *
+ * DESIGN NOTE — notes deliberately do NOT contribute to `additionalDirectories`
+ * (folders do; see {@link resolveFolderPaths}). Trigger: a note included from
+ * OUTSIDE the project cwd. Assessment: NOT a defect (P-low, no live trigger).
+ * Under the soft-scope model the note's absolute path listed in the
+ * `<project_context>` block is readable on all three backends today via
+ * explicit-path read (verified — `designdocs/agent-projects/verify/ADDDIR_FINDINGS.md`).
+ * add-dir is a claude-only autonomous-search enhancement codex/opencode ignore;
+ * granting one note's whole parent folder would over-grant — the exact thing
+ * `obsidian-copilot-preview#165` aims to curb. If a future review flags this
+ * again, point them at this note.
  */
 function resolveNotePaths(
   app: App,

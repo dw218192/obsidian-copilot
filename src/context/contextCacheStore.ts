@@ -2,8 +2,12 @@ import { err2String } from "@/errorFormat";
 import { logWarn } from "@/logger";
 import type { ContextCacheFs } from "./contextCacheFs";
 
-/** Source kinds that get materialized into `.context-cache/` as text snapshots. */
-export type MaterializedSourceType = "web" | "youtube" | "file";
+/** Source kinds that get materialized into `.context-cache/` as text snapshots.
+ * The single source of truth — file-name patterns (see {@link isOwnedCacheFile})
+ * and other modules' source-kind unions derive from this, so adding a kind here
+ * updates them all. */
+export const MATERIALIZED_SOURCE_TYPES = ["web", "youtube", "file"] as const;
+export type MaterializedSourceType = (typeof MATERIALIZED_SOURCE_TYPES)[number];
 
 /** A URL or YouTube link to fetch via brevilabs primitives. */
 export interface RemoteSource {
@@ -103,19 +107,32 @@ export interface MaterializeSourcesResult {
 
 /** Metadata block persisted at the top of every cache file. */
 export interface CacheEntryMeta {
+  /** Cache format version — readers discard a mismatch as a miss (see {@link CACHE_SCHEMA_VERSION}). */
+  schemaVersion: number;
   sourceType: MaterializedSourceType;
   /** Origin URL for web/youtube snapshots. */
   sourceUrl?: string;
   /** Vault path for in-vault file snapshots. */
   sourcePath?: string;
   fetchedAt: string;
-  contentHash: string;
   /** Cheap-skip key: identity for remotes, `mtime:size` for files. */
   fingerprint: string;
 }
 
 const META_OPEN = "<!-- copilot-context-cache";
 const META_CLOSE = "-->";
+/**
+ * Persisted cache-format version. Bump ONLY when an EXISTING field's semantics
+ * change (e.g. the `fingerprint` `mtime:size` format) — readers then treat a
+ * mismatch as a cache miss and re-materialize, instead of misreading an old file
+ * as fresh. Additive/removed fields are tolerant-parsed and need no bump. The
+ * cache is regenerable, so this discards-and-rebuilds rather than migrating
+ * (unlike `settingsVersion`, which migrates non-regenerable settings).
+ *
+ * Exported so tests can stamp a current-version fixture without hardcoding the
+ * number (which would silently break them on the next bump).
+ */
+export const CACHE_SCHEMA_VERSION = 1;
 export const MANIFEST_FILE_NAME = "CONTEXT.md";
 
 /** Hidden, Obsidian-ignored dir under a project folder (the agent still greps
@@ -133,6 +150,8 @@ export const CONTEXT_CACHE_DIR = ".context-cache";
  * when the source later succeeds.
  */
 export interface FailureMarker {
+  /** Cache format version — readers discard a mismatch as a miss (see {@link CACHE_SCHEMA_VERSION}). */
+  schemaVersion: number;
   source: string;
   kind: MaterializedSourceType;
   error: string;
@@ -476,12 +495,15 @@ function joinCachePath(dir: string, name: string): string {
  * `failed-<type>-<hash>.json` failure marker, or the legacy `CONTEXT.md`
  * manifest (no longer written — see {@link reconcileCache}).
  */
+// Built from MATERIALIZED_SOURCE_TYPES so a new source kind is pruned by
+// `reconcileCache` automatically. The values are plain identifiers, so a bare
+// alternation needs no regex escaping.
+const SOURCE_TYPE_ALTERNATION = MATERIALIZED_SOURCE_TYPES.join("|");
+const OWNED_SNAPSHOT_RE = new RegExp(`^(${SOURCE_TYPE_ALTERNATION})-[0-9a-f]+\\.md$`);
+const OWNED_MARKER_RE = new RegExp(`^failed-(${SOURCE_TYPE_ALTERNATION})-[0-9a-f]+\\.json$`);
+
 function isOwnedCacheFile(name: string): boolean {
-  return (
-    name === MANIFEST_FILE_NAME ||
-    /^(web|youtube|file)-[0-9a-f]+\.md$/.test(name) ||
-    /^failed-(web|youtube|file)-[0-9a-f]+\.json$/.test(name)
-  );
+  return name === MANIFEST_FILE_NAME || OWNED_SNAPSHOT_RE.test(name) || OWNED_MARKER_RE.test(name);
 }
 
 /**
@@ -508,7 +530,7 @@ async function writeFailureMarker(
   nowMs: number,
   fingerprint?: string
 ): Promise<void> {
-  const marker: FailureMarker = { source, kind, error, failedAt: nowMs, ...(fingerprint !== undefined ? { fingerprint } : {}) }; // prettier-ignore
+  const marker: FailureMarker = { schemaVersion: CACHE_SCHEMA_VERSION, source, kind, error, failedAt: nowMs, ...(fingerprint !== undefined ? { fingerprint } : {}) }; // prettier-ignore
   await fs.writeText(markerPath, JSON.stringify(marker));
 }
 
@@ -542,6 +564,8 @@ async function readFailureMarker(
 export function parseFailureMarker(raw: string): FailureMarker | null {
   try {
     const parsed = JSON.parse(raw) as Partial<FailureMarker>;
+    // Version mismatch -> treat as no marker, so the source is re-attempted.
+    if (parsed.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
     if (
       typeof parsed.source !== "string" ||
       typeof parsed.kind !== "string" ||
@@ -567,10 +591,10 @@ async function writeEntry(
 ): Promise<void> {
   const fetchedAt = new Date(nowMs).toISOString();
   const meta: CacheEntryMeta = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
     sourceType,
     ...(sourceType === "file" ? { sourcePath: source } : { sourceUrl: source }),
     fetchedAt,
-    contentHash: stableHash(content),
     fingerprint,
   };
   const body = content.trim();
@@ -605,6 +629,10 @@ export function parseSnapshotMeta(raw: string): CacheEntryMeta | null {
   const json = raw.slice(META_OPEN.length, close).trim();
   try {
     const parsed = JSON.parse(json) as Partial<CacheEntryMeta>;
+    // Version mismatch -> treat as a miss so the source re-materializes. Note the
+    // old snapshot is then NOT used as a stale fallback if the re-fetch fails; on
+    // an unreleased format that one-time rebuild is acceptable.
+    if (parsed.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
     const hasSource = Boolean(parsed.sourceUrl ?? parsed.sourcePath);
     if (!parsed.sourceType || !hasSource || !parsed.fetchedAt || !parsed.fingerprint) {
       return null;
