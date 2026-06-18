@@ -4,6 +4,7 @@ import { ChatPromptTemplate } from "@langchain/core/prompts";
 
 import { ModelCapability, ReasoningEffort, Verbosity } from "@/constants";
 import { settingsAtom, settingsStore } from "@/settings/model";
+import { FORK_DEFAULT_PLUS_CHAIN } from "@/tools/forkConfig";
 import { SelectedTextContext } from "@/types/message";
 import { atom, useAtom } from "jotai";
 import { TFile } from "obsidian";
@@ -28,6 +29,11 @@ const chainTypeAtom = atom(
     const userValue = get(userChainTypeAtom);
     if (userValue !== null) {
       return userValue;
+    }
+    // Fork: default to Copilot Plus mode (plain Chat has no tools). Manual chain
+    // switches still take precedence via userChainTypeAtom above.
+    if (FORK_DEFAULT_PLUS_CHAIN) {
+      return ChainType.COPILOT_PLUS_CHAIN;
     }
     return get(settingsAtom).defaultChainType;
   },

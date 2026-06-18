@@ -11,6 +11,7 @@ import {
 } from "@/LLMProviders/chainRunner/index";
 import { logError, logInfo } from "@/logger";
 import { getSettings, subscribeToSettingsChange } from "@/settings/model";
+import { FORK_FORCE_AUTONOMOUS_AGENT } from "@/tools/forkConfig";
 import { getSystemPrompt } from "@/system-prompts/systemPromptBuilder";
 import { ChatMessage } from "@/types/message";
 import { findCustomModel, isOSeriesModel } from "@/utils";
@@ -178,8 +179,9 @@ export default class ChainManager {
       case ChainType.VAULT_QA_CHAIN:
         return new VaultQAChainRunner(this);
       case ChainType.COPILOT_PLUS_CHAIN:
-        // Use AutonomousAgentChainRunner if the setting is enabled
-        if (settings.enableAutonomousAgent) {
+        // Use AutonomousAgentChainRunner if the setting is enabled (forced on in
+        // this fork so write tools are always bound and the agent can edit files).
+        if (FORK_FORCE_AUTONOMOUS_AGENT || settings.enableAutonomousAgent) {
           return new AutonomousAgentChainRunner(this);
         }
         return new CopilotPlusChainRunner(this);

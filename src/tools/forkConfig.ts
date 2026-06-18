@@ -45,6 +45,20 @@ export const FORK_AUTOCONTEXT_TEXT_ONLY: boolean = true;
 export const FORK_AUTO_PDF_CURRENT_PAGE: boolean = true;
 
 /**
+ * Force Autonomous Agent mode on regardless of the saved `enableAutonomousAgent`
+ * setting. Without the agent loop, write tools (writeFile/editFile) aren't bound
+ * and the model can only describe edits instead of making them. Not for upstreaming.
+ */
+export const FORK_FORCE_AUTONOMOUS_AGENT: boolean = true;
+
+/**
+ * Default new chats to Copilot Plus mode instead of plain Chat (which has no
+ * tools). This only changes the default — the chain selector still lets the user
+ * switch modes per session. Not for upstreaming.
+ */
+export const FORK_DEFAULT_PLUS_CHAIN: boolean = true;
+
+/**
  * Append the built-in `web_search` tool to a bindTools() tools array when the
  * given chat model uses the OpenAI Responses API; otherwise return the array
  * unchanged. Whether the model actually invokes it is up to the model (reasoning
